@@ -1,9 +1,9 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.0.0  
-**Status:** Draft for implementation  
-**Primary stack:** Python 3.11+, Scrapy, Playwright, curl_cffi  
+**Version:** 1.1.0  
+**Status:** Draft for implementation (revised after architecture / OPSEC review)  
+**Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
 ---
@@ -22,22 +22,27 @@ Modern targets no longer serve useful content via naive HTTP clients. Anti-bot s
 | --- | --- | --- |
 | IP reputation | ASN, datacenter ranges, prior abuse | Instant 403 / challenge from AWS/GCP IPs |
 | TLS fingerprinting (JA3/JA4) | ClientHello cipher suites & extensions | `requests`/`urllib3` blocked before HTML |
+| HTTP/2 framing | SETTINGS frame, window sizes, pseudo-header order | TLS-ok clients still fail Akamai/CF checks |
 | HTTP header heuristics | UA, `Sec-Fetch-*`, header order, Accept consistency | Easy bot classification |
 | Browser fingerprinting | `navigator.webdriver`, canvas, WebGL, fonts, plugins | Stock headless Chrome detected in ms |
+| Network OPSEC leaks | Host DNS / WebRTC ICE candidates bypassing proxy | Operator real IP burned despite proxy config |
 | Behavioral analysis | Timing, mouse/scroll, navigation graph | Fixed-interval crawlers flagged mid-session |
 | JS challenges / CAPTCHAs | Turnstile, reCAPTCHA v3, hCaptcha | Non-JS clients stuck in challenge loops |
-| Honeypots | Hidden links (`display:none`, white-on-white) | Blind crawlers self-incriminate |
+| Honeypots | Hidden links (`display:none`, white-on-white, external CSS) | Blind L0/L1 crawlers self-incriminate |
 
 Ariadne must defeat or gracefully degrade across these layers **within authorized engagement rules**, while remaining polite enough not to DoS the target.
 
 ### 1.2 Design principles
 
 1. **Authorization first** — scope files, allowlists, and hard kill-switches are mandatory, not optional.
-2. **Progressive fidelity** — start cheap (HTTP + TLS impersonation); escalate to fortified browsers only when needed.
-3. **Layered evasion** — no single technique is sufficient; IP, TLS, headers, fingerprint, and behavior must align.
-4. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
-5. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
-6. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
+2. **Progressive fidelity** — start cheap (HTTP + TLS/HTTP2 impersonation); escalate to fortified browsers only when needed.
+3. **Layered evasion** — no single technique is sufficient; IP, TLS, HTTP/2, headers, fingerprint, and behavior must align.
+4. **Session coherence** — L1↔L2 handoff shares one persona (UA, Client Hints, cookies, proxy sticky ID); clearance cookies are worthless without matching fingerprints.
+5. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
+6. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
+7. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
+8. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
+9. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
 
 ---
 
@@ -50,6 +55,7 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 - Passive and active recon extraction: headers, cookies, CSP, tech fingerprints, robots/sitemap analysis
 - Controlled interaction: pagination, filters, login (with provided credentials), modal dismissal, infinite scroll
 - Defense telemetry: challenge types encountered, CAPTCHA frequency, WAF signatures, rate-limit thresholds
+- Extraction of `robots.txt` `Disallow` / `Allow` paths as **high-value recon hints** (see §2.3)
 
 ### 2.2 Explicitly out of scope
 
@@ -67,9 +73,22 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 | Scope file | YAML/JSON allowlist of domains, path prefixes, IP ranges; deny-by-default |
 | Engagement metadata | Client, ticket ID, operator, start/end timestamps written into every run artifact |
 | Rate ceilings | Global and per-host max concurrency and RPS; cannot be overridden without `--force-unsafe` + audit log |
-| robots.txt | Configurable: `obey` (default for polite recon), `observe` (log but continue), `ignore` (requires explicit flag + justification field) |
+| robots.txt | **Default: `observe`** — parse and log rules, promote `Disallow` paths into the endpoint inventory as high-value candidates, but **do not block** crawling. Modes: `observe` (default), `obey` (polite / ToS-sensitive engagements), `ignore` (skip fetch entirely). No dual-attestation nag for `ignore`. |
 | Kill switch | Env var / file watch / SIGTERM that drains queue and exits cleanly |
 | Secrets | Credentials and proxy keys only via env / secret store; never committed |
+
+#### 2.3.1 The robots.txt paradox (red team rationale)
+
+For commodity scrapers, `obey` is polite. For security testing it is often an **anti-pattern**: developers routinely hide staging APIs, admin panels, and sensitive routes behind `Disallow`. Obeying blinds the operator to high-value attack surface.
+
+**Default behavior (`observe`):**
+
+1. Fetch and parse `robots.txt` / sitemaps when present.  
+2. Emit `RobotsHintItem` entries for every `Disallow` / interesting `Allow` path (scoped to allowlisted hosts).  
+3. Continue crawling those paths subject to normal scope + rate rules.  
+4. Record that the path was robots-disallowed in artifacts for the report (transparency to the client).
+
+Use `obey` only when the ROE or client explicitly requires crawl-delay / disallow compliance.
 
 ---
 
@@ -80,19 +99,23 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 | ID | Goal | Success measure |
 | --- | --- | --- |
 | G1 | Crawl static and JS-heavy targets under authorized scope | ≥95% page success on moderate-protection sites with residential proxies |
-| G2 | Survive common anti-bot stacks with progressive escalation | Automatic escalate HTTP → TLS-impersonate → stealth Playwright on challenge signals |
+| G2 | Survive common anti-bot stacks with progressive escalation | Automatic escalate HTTP → TLS/H2-impersonate → stealth Playwright on challenge signals |
 | G3 | Produce security-oriented crawl graphs and endpoint inventories | JSON/NDJSON export of URLs, methods, params, status codes, response fingerprints |
 | G4 | Capture client-side API traffic during browser sessions | Record XHR/fetch URLs, methods, request/response samples (PII-redacted option) |
-| G5 | Avoid honeypots and self-fingerprinting | Zero honeypot follows in unit/integration tests; visibility checks on links |
+| G5 | Avoid honeypots and self-fingerprinting | Zero honeypot follows in tests; L1 unverified links deferred or risk-scored |
 | G6 | Operate politely under load | Configurable delays; exponential backoff on 429/503; never ignore Retry-After by default |
 | G7 | Remain operable when DOM structure drifts | Health checks / canary URLs; selector fallbacks; alert on extraction failure rate |
+| G8 | Preserve session coherence across L1↔L2 | Clearance cookies acquired in L2 remain valid when traffic returns to L1 |
+| G9 | No host IP leakage via DNS/WebRTC | Proxy-forced DNS; WebRTC disabled; leak canary tests pass |
 
 ### 3.2 Non-goals
 
 - Replacing commercial unlocker APIs for every hardened enterprise target (optional integration only)
 - Guaranteed 100% bypass of all CAPTCHA / bot vendors
-- Full AI agent natural-language browsing as primary path (may be optional Phase 3)
+- Full AI agent natural-language browsing as primary path (may be optional Phase 4)
 - General-purpose marketplace price scraping SaaS
+- First-party vendor SDKs for every proxy provider (generic HTTP(S) proxies only for MVP)
+- Dual browser automation stacks (Playwright-only for MVP; no SeleniumBase UC in Phase 1–2)
 
 ---
 
@@ -104,19 +127,21 @@ Informed by current industry practice (2025–2026 anti-bot landscape):
 
 1. **IP analysis** — volume, ASN reputation, known proxy lists, geo mismatch vs `Accept-Language` / locale  
 2. **TLS / JA3–JA4** — Python default stacks fingerprint as non-browser  
-3. **HTTP fingerprints** — incomplete headers, wrong header order, stale User-Agents, missing `Sec-CH-UA` / `Sec-Fetch-*`  
-4. **Browser automation leaks** — `navigator.webdriver`, HeadlessChrome UA, missing plugins, abnormal WebGL/canvas  
-5. **Behavioral ML** — constant inter-request timing, zero mouse/scroll, deep-link entry without referrer path  
-6. **Challenges** — Cloudflare Turnstile / JS challenge, reCAPTCHA v3 scores, hCaptcha, Akamai sensor cookies (`_abck`)  
-7. **Honeypots** — CSS-hidden links, off-screen anchors, trap query params  
-8. **Session continuity breaks** — cookie / clearance loss causing re-challenge storms  
+3. **HTTP/2 fingerprinting** — SETTINGS parameters, `INITIAL_WINDOW_SIZE`, stream priorities, and pseudo-header ordering (`:method`, `:authority`, `:scheme`, `:path`) must match the claimed browser; Akamai and Cloudflare validate this **in addition to** TLS  
+4. **HTTP header fingerprints** — incomplete headers, wrong header order, stale User-Agents, missing `Sec-CH-UA` / `Sec-Fetch-*`  
+5. **Browser automation leaks** — `navigator.webdriver`, HeadlessChrome UA, missing plugins, abnormal WebGL/canvas  
+6. **DNS / WebRTC leaks** — browser resolves DNS or gathers ICE candidates on the host NIC, exposing the operator IP despite an HTTP proxy  
+7. **Behavioral ML** — constant inter-request timing, zero mouse/scroll, deep-link entry without referrer path  
+8. **Challenges** — Cloudflare Turnstile / JS challenge, reCAPTCHA v3 scores, hCaptcha, Akamai sensor cookies (`_abck`)  
+9. **Honeypots** — CSS-hidden links (inline **or** external stylesheet / JS-applied), off-screen anchors, trap query params  
+10. **Session continuity breaks** — cookie / clearance loss, or clearance reused under a **different** JA3/UA than the solving session  
 
 ### 4.2 Vendor profiles (reference)
 
 | Vendor | Notable signals | Preferred Ariadne counter |
 | --- | --- | --- |
-| Cloudflare | Turnstile, JA4, IP score, `cf_clearance` | Stealth browser + sticky residential session; reuse clearance |
-| Akamai | Client sensor JS, `_abck`, TLS cross-check | Full browser context; consistent cipher/UA pairing |
+| Cloudflare | Turnstile, JA4, HTTP/2 frame fingerprint, IP score, `cf_clearance` | Stealth browser + sticky residential session; Session Sync before L1 reuse |
+| Akamai | Client sensor JS, `_abck`, TLS **and** HTTP/2 cross-check | Full browser context; curl_cffi profile with matching H2 SETTINGS + UA |
 | DataDome | ASN + cadence + header entropy + JS | Mobile/residential sticky sessions; human timing |
 | PerimeterX / HUMAN | Delayed enforcement via behavior | Mouse/scroll simulation; session warmup; avoid burst patterns |
 
@@ -131,42 +156,104 @@ Informed by current industry practice (2025–2026 anti-bot landscape):
 └────────────────────────────────┬────────────────────────────────────────┘
                                  │
 ┌────────────────────────────────▼────────────────────────────────────────┐
-│                         Scrapy Engine (core)                             │
+│              Scrapy Engine (AsyncioSelectorReactor ONLY)                 │
 │  Scheduler │ Downloader │ Spider │ Item Pipeline │ Extensions            │
 └─────┬──────────────┬───────────────┬──────────────────┬─────────────────┘
       │              │               │                  │
       ▼              ▼               ▼                  ▼
 ┌──────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐
 │ Scope &  │  │ Downloader  │  │ Browser     │  │ Item Pipelines     │
-│ Policy   │  │ Middlewares │  │ Pool        │  │                    │
-│ Gateway  │  │             │  │ (Playwright │  │ - validate/schema  │
-│          │  │ - headers   │  │  stealth)   │  │ - dedupe           │
-│ robots   │  │ - TLS imp.  │  │             │  │ - endpoint invent. │
-│ rate     │  │ - proxy rot │  │ - humanize  │  │ - storage exporters│
-│ allow    │  │ - retry/backoff│ │ - CDP APIs │  │ - evidence pack    │
-└──────────┘  └─────────────┘  └─────────────┘  └────────────────────┘
-      │              │               │
-      └──────────────┴───────────────┘
-                     │
-         ┌───────────▼───────────┐
-         │  Proxy / Session Mgr  │
-         │  datacenter|resi|mobile│
-         │  sticky sessions      │
-         └───────────────────────┘
+│ Policy   │  │ Middlewares │  │ Pool (L2)   │  │                    │
+│ Gateway  │  │             │  │ long-lived  │  │ - validate/schema  │
+│          │  │ - headers   │  │ contexts    │  │ - dedupe           │
+│ robots   │  │ - TLS+H2    │  │ + checkout  │  │ - endpoint invent. │
+│ observe  │  │ - proxy/DNS │  │   manager   │  │ - conditional I/O  │
+│ rate     │  │ - escalate  │  │ - humanize  │  │ - evidence pack    │
+└──────────┘  └──────┬──────┘  └──────┬──────┘  └────────────────────┘
+                     │                │
+                     └────────┬───────┘
+                              ▼
+              ┌───────────────────────────────┐
+              │   Session Synchronization     │
+              │   Service (shared state)      │
+              │   persona · cookies · proxy   │
+              │   sticky ID · clearance TTL   │
+              └───────────────┬───────────────┘
+                              ▼
+              ┌───────────────────────────────┐
+              │   Proxy / DNS Policy Layer    │
+              │   datacenter|resi|mobile      │
+              │   proxy-DNS · no WebRTC       │
+              └───────────────────────────────┘
 ```
 
-### 5.1 Progressive downloader strategy
+### 5.1 Mandatory asyncio reactor (scaffolding requirement)
+
+Scrapy’s default Twisted reactor and Playwright/`curl_cffi` asyncio APIs do not mix cleanly. **Ariadne MUST run exclusively on:**
+
+```python
+TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+```
+
+This is non-negotiable from Phase 1 scaffolding onward. All custom download handlers that call asyncio libraries MUST use Scrapy’s asyncio bridge (`deferred_from_coro` / install patterns documented for Scrapy ≥ 2.11) and MUST NOT block the event loop with synchronous Playwright or long CPU work.
+
+**Acceptance for scaffolding:** `ariadne doctor` fails closed if the asyncio reactor is not active.
+
+### 5.2 Browser Pool (L2) — long-lived contexts, not per-request browsers
+
+Spinning up a new Chromium + context per request is too slow and burns fingerprints. L2 uses a **pool of long-lived browser contexts**:
+
+| Property | Requirement |
+| --- | --- |
+| Process model | One (or few) Playwright browser process(es); many isolated `BrowserContext`s |
+| Checkout | Async context manager: `async with pool.checkout(session_id) as ctx:` |
+| Binding | Each context bound to a Session Sync persona + sticky proxy for its lifetime |
+| Concurrency cap | Hard max checked-out contexts (config); excess requests wait or stay on L1 |
+| Isolation | No cookie/localStorage bleed across different `session_id`s |
+| Deadlock avoidance | Checkout timeouts; never hold Scrapy downloader slots while waiting unbounded; release on cancel/errback |
+| Recycling | Contexts recycled after N pages, idle TTL, or clearance invalidation |
+| Scheduler interaction | Download handler awaits checkout with timeout; on timeout → retry later or escalate policy, do not block reactor |
+
+Pool lifecycle is owned by a Scrapy extension started in `spider_opened` and torn down in `spider_closed`.
+
+### 5.3 Session Synchronization Service
+
+Progressive escalation fails in practice when L1 and L2 do not share state. A dedicated **Session Synchronization Service** is the source of truth for:
+
+| Field | Purpose |
+| --- | --- |
+| `session_id` | Stable ID tying sticky proxy + persona + cookie jar |
+| `persona` | UA, Client Hints, locale, timezone, viewport, curl_cffi impersonation profile name |
+| `cookie_jar` | Normalized cookie store (incl. `cf_clearance`, `_abck`, etc.) |
+| `proxy_endpoint` | Sticky proxy URL / session tag |
+| `clearance_meta` | How clearance was obtained (L2), TTL estimate, last validated |
+| `tls_profile` | Impersonation id that **must** match persona UA family |
+| `h2_profile` | HTTP/2 fingerprint expectations tied to the same browser claim |
+
+**Handoff rules (MUST):**
+
+1. On L1 challenge → escalate to L2 **with the same `session_id`**.  
+2. L2 solves challenge using that session’s persona + sticky proxy.  
+3. L2 writes cookies / storage state back to Session Sync before returning the response.  
+4. Subsequent L1 requests for that `session_id` load the synced jar and **identical** UA / Client Hints / TLS+H2 impersonation profile.  
+5. If persona and clearance fingerprints diverge, invalidate clearance and re-escalate (do not silently send mismatched L1 traffic).  
+
+Without this service, `cf_clearance` acquired in Playwright is invalidated the moment `curl_cffi` resumes with a different JA3/UA.
+
+### 5.4 Progressive downloader strategy
 
 Requests flow through escalating transport modes:
 
 | Mode | Transport | When used | Cost / detectability tradeoff |
 | --- | --- | --- | --- |
-| `L0_http` | Scrapy default (Twisted) | Low-protection / internal apps | Fast; weak TLS fingerprint |
-| `L1_impersonate` | `curl_cffi` browser TLS impersonation | External sites with JA3/JA4 checks | Fast; strong TLS; no JS |
-| `L2_browser` | Playwright + stealth patches | JS-rendered / challenge pages | Slow; high fidelity |
+| `L0_http` | Scrapy HTTP via asyncio reactor | Low-protection / internal apps | Fast; weak TLS/H2 fingerprint |
+| `L1_impersonate` | `curl_cffi` browser TLS **and** HTTP/2 impersonation | External sites with JA3/JA4/H2 checks | Fast; strong wire fingerprint; no JS |
+| `L2_browser` | Playwright pool + stealth | JS-rendered / challenge pages | Slow; high fidelity |
 | `L3_unlocker` | Optional commercial unlocker API | Hardened targets after L2 fails | Highest reliability; $$ |
 
 Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatures, Cloudflare interstitial HTML, empty SPA shells, CAPTCHA iframes, DataDome deny pages, soft-block patterns (delayed empty responses).
+
+De-escalation (L2 → L1) is allowed **only** after Session Sync confirms clearance + persona coherence.
 
 ---
 
@@ -177,6 +264,7 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 | Component | Library | Role |
 | --- | --- | --- |
 | Crawl framework | **Scrapy** ≥ 2.11 | Engine, scheduling, middleware, pipelines, concurrency |
+| Event loop | **AsyncioSelectorReactor** (mandatory) | Compatible bridge for Playwright / curl_cffi |
 | Async / items | itemadapter, pydantic v2 | Typed items and validation |
 | HTML parse | parsel (built-in), lxml, selectolax (optional hot path) | Extraction |
 | Config | PyYAML, python-dotenv | Engagement & runtime config |
@@ -187,20 +275,23 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 
 | Component | Library | Role |
 | --- | --- | --- |
-| TLS impersonation | **curl_cffi** | Chrome/Firefox JA3/JA4-compatible HTTP for L1 |
-| Browser automation | **Playwright** (Python) | L2 JS rendering, interaction, network capture |
+| TLS + HTTP/2 impersonation | **curl_cffi** | Chrome/Firefox JA3/JA4 **and** H2 SETTINGS/pseudo-header profiles for L1 |
+| Browser automation | **Playwright** (Python) only for MVP | L2 JS rendering, interaction, network capture |
 | Stealth | playwright-stealth / equivalent patches | Mask `webdriver` and common automation leaks |
-| Optional Selenium path | undetected-chromedriver / SeleniumBase UC | Fallback for sites where Playwright is fingerprinted |
-| Fingerprint profiles | curated UA + Client Hints + viewport pools | Consistent persona per session |
-| Humanization | custom middleware + Playwright mouse/scroll helpers | Behavioral noise |
+| Fingerprint profiles | curated UA + Client Hints + viewport + H2 profile pools | Consistent persona per session |
+| Humanization | custom helpers on pooled contexts | Behavioral noise |
+| Session Sync | in-process service (Phase 1–2); optional Redis later | Shared jar/persona across transports |
+
+> **Out of MVP:** Selenium, undetected-chromedriver, SeleniumBase UC. A single browser stack keeps Phase 2 surface area manageable. Revisit only in Phase 4 if Playwright stealth is insufficient for specific targets.
 
 ### 6.3 Networking & resilience
 
 | Component | Library / approach | Role |
 | --- | --- | --- |
-| Proxies | Configurable providers (Bright Data, Oxylabs, etc.) + local list | Rotation; residential preferred for hardened targets |
+| Proxies | **Generic HTTP(S) proxy URLs** via env (`ARIADNE_PROXY_URL` / list). No first-party Bright Data/Oxylabs SDKs in MVP — operators format `user:pass@host:port` (incl. provider session/geo tags in username) | Rotation; residential preferred for hardened targets |
+| DNS via proxy | L1: curl_cffi / proxy CONNECT behavior; L2: proxy with remote DNS (e.g. SOCKS5h or Chromium `--dns-prefetch` disabled + proxy that resolves remotely). Never fall back to host DNS for in-scope traffic | Prevent DNS leaks |
+| WebRTC | Disabled in all L2 launch args / policies | Prevent ICE candidate IP leaks |
 | Retry / backoff | Scrapy Autothrottle + custom RetryMiddleware | 429/`Retry-After`, 403 rotate-and-retry |
-| DNS / HTTP2 | curl_cffi / Playwright native | Match browser protocol behavior |
 | Certificate handling | system trust + optional MITM unlocker paths (documented) | Correct TLS for unlocker modes |
 
 ### 6.4 Security-testing enrichments
@@ -209,15 +300,32 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 | --- | --- | --- |
 | Tech fingerprint | Wappalyzer-like rules (python-Wappalyzer or custom) | Stack identification |
 | URL / param analysis | urlextract, custom parsers | Parameter inventory |
-| robots / sitemap | urllib.robotparser + sitemap crawler spider | Policy observation |
+| robots / sitemap | urllib.robotparser + sitemap crawler | **Observe** mode + `RobotsHintItem` extraction |
 | Content hash | xxhash / hashlib | Change detection |
-| Optional LLM extract | provider-agnostic interface | Schema extraction on messy pages (Phase 3) |
+| Optional LLM extract | provider-agnostic interface | Schema extraction on messy pages (Phase 4) |
 
-### 6.5 Storage & export
+### 6.5 Storage & export (I/O-aware)
 
-- Local: SQLite / filesystem NDJSON, HAR exports, screenshot PNGs  
-- Optional: PostgreSQL, S3-compatible object store  
-- Formats: JSON, CSV, Markdown summary, CycloneDX-like endpoint SBOM (custom), ZIP evidence pack  
+Default artifacts are **lightweight**:
+
+- NDJSON page/endpoint/form/defense streams  
+- Optional SQLite index  
+- Markdown summary via `ariadne report`  
+
+**Conditional / expensive artifacts** (HAR, full-page screenshots, storage-state dumps) are captured **only** when:
+
+1. A challenge / block / CAPTCHA page is detected (debug + evidence), or  
+2. Mode is explicitly `apisnoop` (network HAR for API inventory), or  
+3. An error or state transition occurs (auth success/fail, clearance obtained/lost), or  
+4. Operator sets `output.capture: always` (discouraged; warn on large scopes).  
+
+Ephemeral local storage is the default. Client delivery uses:
+
+```bash
+ariadne pack ./artifacts/ENGAGEMENT --encrypt   # GPG-encrypt bundle for handoff
+```
+
+No built-in cloud retention policy in MVP.
 
 ---
 
@@ -227,10 +335,10 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 
 | Mode | Description |
 | --- | --- |
-| `map` | Discover URLs only (links, sitemaps, JS route hints); minimal body storage |
+| `map` | Discover URLs only (links, sitemaps, JS route hints, robots Disallow hints); minimal body storage |
 | `extract` | Full extraction per spider rules / CSS/XPath / JSON-LD |
-| `apisnoop` | Browser mode with network interception; inventory XHR/fetch/WebSocket endpoints |
-| `auth` | Login flow then scoped crawl with session jar |
+| `apisnoop` | Browser mode with network interception; inventory XHR/fetch/WebSocket; **enables HAR** |
+| `auth` | Login flow then scoped crawl with session jar via Session Sync |
 | `canary` | Periodic health checks against known selectors for drift detection |
 | `passive` | Headers/cookies/CSP/tech only; no deep link follow |
 
@@ -240,24 +348,28 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 
 1. Rotate User-Agents from a **current** browser version pool (stale UAs are themselves a signal).  
 2. Emit complete browser-like headers: `Accept`, `Accept-Language`, `Accept-Encoding`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`, `Sec-CH-UA*` when claiming Chromium.  
-3. Keep **UA ↔ Client Hints ↔ TLS impersonation profile** internally consistent.  
+3. Keep **UA ↔ Client Hints ↔ TLS impersonation ↔ HTTP/2 profile** internally consistent (Session Sync enforces this).  
 4. Set realistic `Referer` (Google locale-matched, or same-site navigation referrer).  
-5. Support cookie jar persistence per sticky session (including `cf_clearance` reuse within TTL).  
+5. Support cookie jar persistence per sticky session (including `cf_clearance` reuse within TTL) via Session Sync.  
+6. When using L1 `curl_cffi`, select an impersonation profile that matches **both** TLS (JA3/JA4) **and** HTTP/2 fingerprint (SETTINGS / window / pseudo-header order) of the claimed browser — not TLS alone.  
 
 **SHOULD:**
 
-6. Randomize viewport and locale in concert with proxy geolocation.  
-7. Prefer HTTP/2 when impersonating modern Chrome.  
+7. Randomize viewport and locale in concert with proxy geolocation.  
+8. Prefer HTTP/2 when impersonating modern Chrome (and fail tests if H2 fingerprint diverges from profile).  
 
-### 7.3 Proxy & session management
+### 7.3 Proxy, DNS & OPSEC
 
 **MUST:**
 
-1. Support datacenter, residential, and mobile proxy classes with per-target policy.  
-2. Rotate on hard blocks; support **sticky sessions** for challenge clearance and auth.  
-3. Match proxy geo to target expectation and header locale.  
+1. Support datacenter, residential, and mobile proxy classes via generic proxy URL templates (class inferred from operator config, not vendor SDK).  
+2. Rotate on hard blocks; support **sticky sessions** for challenge clearance and auth (sticky ID stored in Session Sync).  
+3. Match proxy geo to target expectation and header locale when the proxy URL encoding supports it.  
 4. Retire bad proxies (consecutive failures / challenge loops) from the active pool.  
 5. Never log full proxy credentials in plain logs (redact).  
+6. **Force DNS resolution through the proxy path** for L1 and L2. Host-resolver bypass is a defect.  
+7. **Disable WebRTC** (and related STUN) in L2 launch arguments / Chromium policies so ICE candidates cannot expose the operator IP.  
+8. Provide a `ariadne doctor --leak-check` (or test fixture) that fails if WebRTC/DNS leak the host address when a proxy is configured.  
 
 ### 7.4 Timing & politeness
 
@@ -267,25 +379,27 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 2. Honor `Retry-After` on 429.  
 3. Exponential backoff with jitter on 429/503/soft-block.  
 4. Integrate Scrapy Autothrottle; downshift when latency rises (intentional slowdown / overload signal).  
-5. Support `Crawl-delay` from robots.txt when `robots: obey`.  
+5. Honor `Crawl-delay` from robots.txt **only** when `respect_robots: obey`.  
 
 ### 7.5 Browser / dynamic content (L2)
 
 **MUST:**
 
-1. Wait strategies: `domcontentloaded`, `networkidle`, selector-based waits, `waitForResponse` for known APIs.  
-2. Infinite scroll / lazy-load helpers with randomized scroll depths and pauses.  
-3. Stealth patches for common automation fingerprints.  
-4. Prefer headed or `--headless=new` where stealth requires it; make mode configurable.  
-5. Resource blocking (images/fonts/CSS) as an **opt-in** speed mode — disabled by default on high-stealth targets (missing resources can alter fingerprints).  
-6. Persist and restore storage state (cookies + localStorage) between runs.  
-7. Capture screenshots on challenge/block for evidence.  
+1. Serve pages from the Browser Pool (§5.2), not one-shot browser launches per request.  
+2. Wait strategies: `domcontentloaded`, `networkidle`, selector-based waits, `waitForResponse` for known APIs.  
+3. Infinite scroll / lazy-load helpers with randomized scroll depths and pauses.  
+4. Stealth patches for common automation fingerprints.  
+5. Prefer headed or `--headless=new` where stealth requires it; make mode configurable.  
+6. Resource blocking (images/fonts/CSS) as an **opt-in** speed mode — disabled by default on high-stealth targets (missing resources can alter fingerprints).  
+7. Persist and restore storage state through Session Sync (cookies + localStorage).  
+8. Capture screenshots **conditionally** (§6.5) — challenges, errors, auth transitions — not every page.  
+9. Apply DNS-via-proxy + WebRTC-disabled launch config on every browser/context (§7.3).  
 
 **SHOULD:**
 
-8. Simulate mouse movement trajectories and occasional mis-clicks / hesitation.  
-9. Warm up sessions (homepage → category → deep page) instead of cold deep-linking.  
-10. Multi-browser engine option (Chromium primary; Firefox/WebKit for quirk bypass).  
+10. Simulate mouse movement trajectories and occasional mis-clicks / hesitation.  
+11. Warm up sessions (homepage → category → deep page) instead of cold deep-linking.  
+12. Multi-browser engine option post-MVP (Chromium primary; Firefox/WebKit for quirk bypass).  
 
 ### 7.6 Honeypot avoidance
 
@@ -293,8 +407,20 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 
 1. Skip links with computed/inlined `display:none`, `visibility:hidden`, zero opacity, off-screen positioning when detectable.  
 2. Skip common trap class names (`honeypot`, `hidden`, `invisible`, etc. — configurable).  
-3. Prefer Playwright `is_visible()` in L2 over HTML-only checks.  
+3. Prefer Playwright `is_visible()` (computed style) in L2 over HTML-only checks.  
 4. Never follow `mailto:`, `javascript:`, or out-of-scope schemes unless explicitly enabled.  
+
+**L0/L1 visibility gap (MUST address):**
+
+Static HTML cannot evaluate styles applied via external CSS or JavaScript. A naive L1 crawler will follow honeypots that L2 would skip.
+
+| Policy | Behavior |
+| --- | --- |
+| `honeypot.l1_unverified: defer` (default) | Queue unverifiable links to an **L2 validation queue**; only schedule for full crawl after visibility confirmation (or drop if invisible) |
+| `honeypot.l1_unverified: risk_score` | Assign risk score from heuristics (suspicious classes, odd URL patterns, no anchor text, etc.); follow only below threshold |
+| `honeypot.l1_unverified: follow` | Aggressive; log warning — not recommended |
+
+Inline-style / obvious trap heuristics still apply on L1 before deferral.
 
 ### 7.7 CAPTCHA & challenge handling
 
@@ -303,8 +429,9 @@ Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatu
 1. Detect challenge pages (signature matchers for Cloudflare, DataDome, Akamai, reCAPTCHA, hCaptcha, Turnstile).  
 2. Prefer **avoidance** (better IP/behavior) over solving.  
 3. Pluggable solver interface (2Captcha / Anti-Captcha / CapSolver / unlocker API).  
-4. After solve, keep session sticky so clearance cookies persist.  
+4. After solve, write clearance into Session Sync and keep sticky proxy + persona for that `session_id`.  
 5. Budget caps: max solves per run; alert when exceeded.  
+6. On de-escalate to L1, verify persona/TLS/H2 still match the solving session (§5.3).  
 
 ### 7.8 Security recon outputs
 
@@ -314,12 +441,15 @@ Every successful (and relevant failed) response SHOULD contribute to:
 | --- | --- |
 | URL inventory | Absolute URL, status, content-type, depth, parent URL, mode (L0–L3) |
 | Endpoint inventory | API paths from HTML, JS bundles, and network capture; HTTP methods if known |
+| Robots hints | `Disallow`/`Allow` paths promoted as recon candidates (`observe` mode) |
 | Parameter map | Query/body/path params with example values (redaction rules applied) |
 | Form catalog | action, method, input names/types, CSRF token field names |
 | Header dossier | Server, powered-by, CSP, CORS, cookies flags (Secure/HttpOnly/SameSite) |
 | Tech fingerprint | CMS, frameworks, CDNs, bot vendors inferred |
-| Defense events | Challenge type, block code, proxy class used, escalation path |
+| Defense events | Challenge type, block code, proxy class used, escalation path, session_id |
 | Diff / canary | Hash of key selectors vs baseline |
+
+Heavy blobs (HAR, PNG) follow conditional capture rules (§6.5).
 
 ### 7.9 Prefer APIs over HTML when discovered
 
@@ -327,7 +457,7 @@ When network capture or static JS analysis reveals backend JSON endpoints that s
 
 1. Record them in the endpoint inventory.  
 2. Optionally switch spider to API mode for efficiency (lower bot scrutiny, structured data).  
-3. Document auth headers/tokens required; store tokens only in secret-backed session store.  
+3. Document auth headers/tokens required; store tokens only in Session Sync / secret-backed store.  
 
 ### 7.10 Site change detection
 
@@ -343,12 +473,14 @@ When network capture or static JS analysis reveals backend JSON endpoints that s
 
 | Category | Requirement |
 | --- | --- |
-| Performance | L0/L1: hundreds of concurrent requests (proxy-limited). L2: tens of concurrent browser contexts with pool caps |
-| Reliability | Idempotent retries; resume from jobdir / queue snapshot |
-| Security | No secrets in repo; PII redaction hooks; TLS verification on by default |
+| Performance | L0/L1: hundreds of concurrent requests (proxy-limited). L2: capped concurrent **checked-out** contexts from the pool |
+| Event loop | No blocking calls on the asyncio reactor; Playwright work must be awaited |
+| Reliability | Idempotent retries; resume from jobdir / queue snapshot; Session Sync durable for run lifetime |
+| Disk I/O | Default NDJSON-only; HAR/screenshots conditional to avoid multi-GB exhaustion on large maps |
+| Security / OPSEC | No secrets in repo; PII redaction; TLS verify on; DNS/WebRTC leak protections |
 | Portability | Linux primary; Docker image with Playwright deps |
-| Observability | Structured logs, Prometheus-optional metrics (success rate, challenge rate, latency, proxy health) |
-| Testability | pytest unit tests for middlewares; integration tests against local fixture servers; optional live canaries behind flag |
+| Observability | Structured logs, optional Prometheus (success rate, challenge rate, latency, pool wait time, proxy health) |
+| Testability | pytest unit tests; local fixtures; leak-check; H2/TLS profile contract tests |
 
 ---
 
@@ -373,7 +505,7 @@ scope:
     - ".*/logout.*"
     - ".*/admin/delete.*"
   max_depth: 5
-  respect_robots: obey   # obey | observe | ignore
+  respect_robots: observe   # observe (default) | obey | ignore
 
 crawl:
   mode: apisnoop         # map | extract | apisnoop | auth | canary | passive
@@ -382,6 +514,8 @@ crawl:
   transport:
     initial_mode: L1_impersonate
     escalate_to: [L2_browser, L3_unlocker]
+    # curl_cffi profile must match persona UA + HTTP/2 fingerprint
+    impersonate: chrome131
   concurrency:
     max_concurrent_requests: 8
     download_delay_mean: 3.5
@@ -390,13 +524,20 @@ crawl:
     headless: false
     stealth: true
     humanize: true
-    capture_network: true
+    capture_network: true      # apisnoop / conditional HAR
+    pool_size: 4               # max concurrent BrowserContexts
+    checkout_timeout_seconds: 60
+    disable_webrtc: true       # mandatory default
+    proxy_dns: true            # mandatory when proxy set
+  honeypot:
+    l1_unverified: defer       # defer | risk_score | follow
   proxies:
+    # Generic URL(s); provider geo/session tags encoded in userinfo by operator
+    # e.g. http://user-country-us-session-abc:pass@proxy.example:8080
     class: residential
-    geo: "us"
     sticky_ttl_seconds: 600
   captcha:
-    provider: null         # or 2captcha | capsolver | unlocker
+    provider: null             # or 2captcha | capsolver | unlocker
     max_solves: 25
   auth:
     enabled: false
@@ -404,13 +545,24 @@ crawl:
 
 output:
   dir: "./artifacts/ACME-2026-Q3-WEB"
-  formats: [ndjson, har, screenshots, markdown_summary]
+  formats: [ndjson, markdown_summary]   # har/screenshots are conditional by default
+  capture:
+    screenshots: on_challenge_or_error  # never | on_challenge_or_error | always
+    har: on_apisnoop_or_challenge       # never | on_apisnoop_or_challenge | always
   redact_pii: true
 ```
 
+Proxy credentials via env, e.g. `ARIADNE_PROXY_URL` or `ARIADNE_PROXY_LIST_FILE` — not committed YAML secrets.
+
 ### 9.2 Runtime settings (Scrapy `settings.py` mapping)
 
-Expose Scrapy knobs through Ariadne config: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES_ENABLED`, `RETRY_HTTP_CODES`, custom middleware order, Playwright launch options, curl_cffi impersonation profile (e.g., `chrome131`).
+**MUST set in scaffolding:**
+
+```python
+TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+```
+
+Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES_ENABLED` (jar ultimately owned by Session Sync), `RETRY_HTTP_CODES`, middleware order, Playwright launch options, curl_cffi `impersonate` profile, browser pool size / checkout timeout.
 
 ---
 
@@ -420,44 +572,60 @@ Expose Scrapy knobs through Ariadne config: `CONCURRENT_REQUESTS`, `DOWNLOAD_DEL
 
 | Spider | Responsibility |
 | --- | --- |
-| `ScopeSpider` | Base class enforcing allow/deny, depth, honeypot filters |
-| `MapSpider` | Link discovery + sitemap seed expansion |
+| `ScopeSpider` | Base class enforcing allow/deny, depth, honeypot policy |
+| `MapSpider` | Link discovery + sitemap seed expansion + robots hint ingestion |
 | `ExtractSpider` | Rule-based field extraction (per-target YAML rules) |
 | `ApiSnoopSpider` | L2 crawl with network event listeners |
-| `AuthSpider` | Login sequence then handoff to Map/Extract |
+| `AuthSpider` | Login sequence then handoff via Session Sync |
 | `CanarySpider` | Drift checks |
 
 ### 10.2 Middlewares (Downloader)
 
 1. **ScopeMiddleware** — drop OOS requests early  
-2. **PersonaHeadersMiddleware** — consistent header bundles  
-3. **TlsImpersonateMiddleware** — L1 via curl_cffi  
-4. **ProxyMiddleware** — rotate / sticky / geo  
-5. **BackoffMiddleware** — 429/403/503 policy  
-6. **ChallengeDetectMiddleware** — classify blocks; request escalation  
-7. **PlaywrightDownloadHandler** — L2 render path  
-8. **HoneypotFilterMiddleware** — filter discovered links before schedule  
+2. **SessionSyncMiddleware** — attach `session_id`, load persona + cookies onto request meta  
+3. **PersonaHeadersMiddleware** — header bundles from Session Sync persona  
+4. **TlsHttp2ImpersonateHandler** — L1 via curl_cffi (TLS + H2)  
+5. **ProxyMiddleware** — rotate / sticky / geo; enforce proxy-DNS policy  
+6. **BackoffMiddleware** — 429/403/503 policy  
+7. **ChallengeDetectMiddleware** — classify blocks; request L2 escalation with same `session_id`  
+8. **PlaywrightPoolDownloadHandler** — L2 via Browser Pool checkout  
+9. **HoneypotFilterMiddleware** — filter / defer unverified L1 links  
 
 ### 10.3 Middlewares (Spider)
 
 1. **LinkNormalizer** — canonicalize, strip tracking params (configurable)  
 2. **JsRouteHintExtractor** — regex/AST-lite extraction of paths from JS  
-3. **DefenseEventEmitter** — structured challenge events  
+3. **RobotsHintEmitter** — promote Disallow paths to inventory under `observe`  
+4. **DefenseEventEmitter** — structured challenge events  
 
 ### 10.4 Pipelines
 
 1. Validation (Pydantic)  
 2. Deduplication  
 3. PII redaction  
-4. Endpoint / form / header enrichment  
-5. Exporters (NDJSON, SQLite, HAR writer, evidence ZIP)  
+4. Endpoint / form / header / robots-hint enrichment  
+5. Exporters (NDJSON, optional SQLite; conditional HAR/screenshot writers)  
 
 ### 10.5 Extensions
 
 1. Engagement banner (logs authorization metadata at start)  
-2. Kill-switch watcher  
-3. Metrics exporter  
-4. Canary scheduler  
+2. **AsyncioReactorGuard** — abort if wrong reactor  
+3. **BrowserPoolExtension** — start/stop pool  
+4. **SessionSyncExtension** — process-lifetime session store  
+5. Kill-switch watcher  
+6. Metrics exporter (include pool wait time, escalation counts)  
+7. Canary scheduler  
+
+### 10.6 Session Synchronization Service (API sketch)
+
+```text
+get_or_create(session_id | host) -> Session
+bind_persona(session, persona)
+get_cookies(session) / set_cookies(session, cookies)
+get_storage_state(session) / set_storage_state(...)   # Playwright format
+invalidate_clearance(session, reason)
+assert_coherent(session) -> bool   # UA/TLS/H2/cookie constraints
+```
 
 ---
 
@@ -465,24 +633,28 @@ Expose Scrapy knobs through Ariadne config: `CONCURRENT_REQUESTS`, `DOWNLOAD_DEL
 
 ```text
 PageItem
-  url, final_url, status, mode, depth, parent_url
+  url, final_url, status, mode, depth, parent_url, session_id
   headers_subset, cookies_subset
   content_hash, scraped_at
   extraction: dict
-  screenshot_path?: str
+  screenshot_path?: str          # only if conditionally captured
+  har_path?: str                 # only if conditionally captured
   defense_events?: list[DefenseEvent]
 
 EndpointItem
-  url, method?, source (html|js|network), auth_required?
+  url, method?, source (html|js|network|robots), auth_required?
   request_sample_redacted?, response_sample_redacted?
   content_type?, parameters: list[Param]
+
+RobotsHintItem
+  host, path, directive (disallow|allow), crawl_decision (followed|skipped_obey)
 
 FormItem
   page_url, action, method, fields: list[Field]
 
 DefenseEvent
-  type (cloudflare|akamai|datadome|perimeterx|captcha|ratelimit|honeypot|unknown)
-  url, status, detail, transport_mode, proxy_class, timestamp
+  type (cloudflare|akamai|datadome|perimeterx|captcha|ratelimit|honeypot|leak|unknown)
+  url, status, detail, transport_mode, proxy_class, session_id, timestamp
 ```
 
 ---
@@ -496,10 +668,12 @@ ariadne crawl -c engagement.yaml
 ariadne canary -c engagement.yaml
 ariadne resume JOBDIR
 ariadne report ./artifacts/ACME-2026-Q3-WEB
-ariadne doctor   # browsers, proxies, solvers connectivity
+ariadne pack ./artifacts/ACME-2026-Q3-WEB --encrypt   # GPG evidence bundle
+ariadne doctor              # reactor, browsers, proxies
+ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 ```
 
-`report` produces a Markdown summary: scope adherence, pages fetched, challenge rates, top endpoints, tech stack, recommended follow-on tests (informational only — no exploit content).
+`report` produces a Markdown summary: scope adherence, pages fetched, challenge rates, robots hints followed, top endpoints, tech stack, recommended follow-on tests (informational only — no exploit content).
 
 ---
 
@@ -507,50 +681,57 @@ ariadne doctor   # browsers, proxies, solvers connectivity
 
 | Layer | What |
 | --- | --- |
-| Unit | Header consistency, honeypot CSS detection, scope regex, backoff math, redaction |
-| Integration | Local Flask/FastAPI fixture sites: static, SPA, rate-limited, honeypot, fake Cloudflare interstitial HTML |
-| Contract | curl_cffi impersonation profile matches configured UA family |
-| Stealth canary | Optional gated tests against public bot-detection demo pages (`nowsecure.nl`-class); never against third-party production without auth |
-| Regression | Canary spiders for customer fixtures stored as HTML snapshots |
+| Unit | Header/persona consistency, honeypot CSS + deferral queue, scope regex, backoff math, redaction, Session Sync coherence checks |
+| Integration | Local fixtures: static, SPA, rate-limited, honeypot (external CSS), fake Cloudflare interstitial; L1→L2→L1 clearance reuse |
+| Contract | curl_cffi impersonation profile matches UA family **and** expected HTTP/2 fingerprint characteristics |
+| Reactor | Boot fails/tests fail if AsyncioSelectorReactor not installed |
+| Pool | Checkout timeout, no deadlock under concurrency saturation, no cross-session cookie bleed |
+| OPSEC | Leak-check: with proxy set, WebRTC/DNS must not expose host IP |
+| Stealth canary | Optional gated tests against public bot-detection demos; never against third-party production without auth |
+| I/O | Assert HAR/screenshots absent on normal `map` crawl; present on challenge fixture |
 
 ---
 
 ## 14. Implementation phases
 
-### Phase 0 — Spec & scaffolding (this document)
+### Phase 0 — Spec & scaffolding
 
-- Repo layout, engagement config schema, CI skeleton  
+- Repo layout, engagement config schema, **AsyncioSelectorReactor** wired, CI skeleton  
 
 ### Phase 1 — Scrapy core + L0/L1
 
-- Scope enforcement, persona headers, curl_cffi downloader, proxy middleware, backoff, map/extract spiders, NDJSON export  
+- Scope enforcement, Session Sync (in-process), persona headers, curl_cffi TLS+H2 handler, generic proxy middleware (DNS-safe), backoff, robots `observe` + hints, map/extract spiders, NDJSON export, L1 honeypot deferral stubs  
 
-### Phase 2 — L2 Playwright stealth + recon
+### Phase 2 — L2 Playwright pool + recon
 
-- Browser pool, humanization, network capture (`apisnoop`), honeypot visibility checks, screenshots, defense event taxonomy  
+- Browser Pool + checkout manager, WebRTC disabled + proxy DNS, humanization, network capture (`apisnoop`), Session Sync L1↔L2 handoff, honeypot visibility validation queue, conditional screenshots, defense event taxonomy  
 
 ### Phase 3 — Hardening & scale
 
-- CAPTCHA solver plugins, L3 unlocker adapter, sticky clearance reuse, metrics, evidence packs, canary/drift system, Docker  
+- CAPTCHA solver plugins, L3 unlocker adapter, metrics (pool wait, escalations), `ariadne pack --encrypt`, canary/drift system, Docker  
 
 ### Phase 4 — Advanced (optional)
 
-- Multi-engine fingerprint profiles, JS bundle static analysis for routes, optional AI extraction for unstructured pages, SeleniumBase UC fallback path  
+- Multi-engine fingerprint profiles, JS bundle static analysis for routes, optional AI extraction, SeleniumBase UC **only if** Playwright path proven insufficient for a documented target class  
 
 ---
 
 ## 15. Acceptance criteria (MVP = end of Phase 2)
 
 1. Given a valid engagement YAML, Ariadne refuses to crawl out-of-scope hosts.  
-2. L1 requests present browser-consistent TLS + headers (validated against a JA3 echo service in tests).  
-3. On JS-rendered fixture SPA, L2 extracts items that L0 cannot.  
-4. Honeypot fixture links are not followed.  
-5. 429 responses respect `Retry-After` and jittered exponential backoff.  
-6. `apisnoop` mode emits EndpointItems from XHR traffic.  
-7. Artifacts include engagement metadata and a Markdown summary.  
-8. Kill-switch stops scheduling new requests within 5 seconds.  
-9. No secrets committed; `ariadne doctor` checks proxy/browser readiness.  
-10. Unit + integration tests pass in CI without live target dependence.
+2. Process runs on `AsyncioSelectorReactor`; `ariadne doctor` detects misconfiguration.  
+3. L1 requests present browser-consistent TLS **and** HTTP/2 fingerprints (contract tests).  
+4. On JS-rendered fixture SPA, L2 extracts items that L0/L1 cannot.  
+5. L1→L2 challenge solve → L1 reuse succeeds on fixture **only when** Session Sync keeps persona+cookies coherent; mismatched persona test fails closed.  
+6. Browser Pool reuses contexts; per-request browser launch is not the default path.  
+7. Honeypot fixture with **external CSS** is not followed from L1 without L2 validation (defer policy).  
+8. With proxy configured, leak-check passes (no host IP via WebRTC/DNS).  
+9. 429 responses respect `Retry-After` and jittered exponential backoff.  
+10. `apisnoop` emits EndpointItems from XHR; HAR exists for that mode; normal `map` does not write per-page HAR/PNG.  
+11. `respect_robots: observe` records `RobotsHintItem`s and still crawls Disallow paths in scope.  
+12. Kill-switch stops scheduling new requests within 5 seconds.  
+13. `ariadne pack --encrypt` produces a client-deliverable archive.  
+14. Unit + integration tests pass in CI without live target dependence.
 
 ---
 
@@ -558,12 +739,17 @@ ariadne doctor   # browsers, proxies, solvers connectivity
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
+| Twisted/asyncio impedance | Timeouts, deadlocks | Mandatory AsyncioSelectorReactor; non-blocking pool checkout |
+| L1↔L2 clearance invalidation | Challenge storms, wasted residential bandwidth | Session Sync coherence asserts before de-escalation |
+| DNS/WebRTC leak | OPSEC failure, ROE incident | Proxy DNS + WebRTC disabled; leak-check in doctor |
+| HTTP/2 fingerprint drift | Silent Akamai/CF blocks despite good TLS | curl_cffi profile contract tests; persona↔profile binding |
+| L1 honeypot follows | Immediate bot flag | Defer unverified links to L2 validation queue |
+| HAR/PNG on every page | Disk/I/O collapse on large scopes | Conditional capture defaults |
 | Anti-bot vendors evolve weekly | Sudden success-rate drop | Progressive modes + unlocker fallback; canary alerts |
 | Stealth plugins go stale | L2 detection | Abstract stealth backend; track Playwright/Chromium versions |
-| Residential proxy cost | Budget overrun | Start L0/L1; escalate only on signals; cache clearance cookies |
+| Residential proxy cost | Budget overrun | Start L0/L1; escalate only on signals; cache clearance via Session Sync |
 | Over-aggression | Accidental DoS / ROE breach | Hard rate ceilings; Autothrottle; engagement time bounds |
-| Legal / ToS conflict | Engagement risk | Authorization gate; robots policy modes; operator attestation field |
-| PII in artifacts | Compliance incident | Redaction pipeline; field allowlists |
+| PII in artifacts | Compliance incident | Redaction pipeline; field allowlists; encrypted pack for handoff |
 
 ---
 
@@ -576,8 +762,9 @@ Ariadne encodes technical controls, but operators remain responsible for:
 3. Minimizing collected personal data; retaining artifacts only as long as the engagement requires.  
 4. Preferring official APIs or customer-provided data exports when they satisfy test objectives.  
 5. Not representing traffic as a search-engine bot unless the ROE explicitly allows it.  
+6. Understanding that `observe` / `ignore` robots modes increase sensitivity — ensure ROE covers this posture.  
 
-The default posture is **polite, scoped, reversible recon** — not maximum-aggression scraping.
+The default posture is **scoped, OPSEC-safe, reversible recon** — not maximum-aggression scraping.
 
 ---
 
@@ -591,19 +778,21 @@ Ariadne/
 ├── ariadne/
 │   ├── __init__.py
 │   ├── cli.py
-│   ├── settings.py
+│   ├── settings.py         # AsyncioSelectorReactor mandated here
 │   ├── items.py
+│   ├── session/            # Session Synchronization Service
+│   ├── browser/            # Browser Pool + checkout manager
 │   ├── spidermiddlewares/
 │   ├── downloadermiddlewares/
-│   ├── downloadhandlers/     # curl_cffi, playwright
+│   ├── downloadhandlers/   # curl_cffi (TLS+H2), playwright pool
 │   ├── pipelines/
 │   ├── extensions/
-│   ├── proxies/
+│   ├── proxies/            # generic proxy URL helpers (no vendor SDKs in MVP)
 │   ├── stealth/
 │   ├── challenges/
 │   ├── spiders/
 │   └── reporting/
-├── engagements/              # example configs (no secrets)
+├── engagements/            # example configs (no secrets)
 ├── tests/
 └── docker/
 ```
@@ -624,18 +813,36 @@ This specification consolidates practices described in contemporary scraping / a
 | [Bright Data — Scraping without getting blocked](https://brightdata.com/blog/web-data/web-scraping-without-getting-blocked) | Layered detection, residential/mobile vs datacenter, Sec-Fetch headers, curl_cffi TLS impersonation, stealth Playwright, Gaussian delays, CAPTCHA automation, honeypots, exponential backoff, geo matching, prefer internal APIs, vendor-specific notes (CF/Akamai/DataDome/PX) |
 | [ScrapFly — Undetected ChromeDriver](https://scrapfly.io/blog/posts/web-scraping-without-blocking-using-undetected-chromedriver) | UC patches vs stock Selenium, proxy attachment limits, headed vs headless stealth tradeoffs, limits against advanced antibots, managed ASP fallbacks |
 
+v1.1 additionally incorporates internal red-team review on Twisted/asyncio impedance, L1↔L2 session handoff, DNS/WebRTC OPSEC, HTTP/2 frame fingerprints, L1 honeypot deferral, robots `observe` default, and conditional evidence I/O.
+
 ---
 
-## 20. Open questions (resolve before Phase 2 complete)
+## 20. Decisions (resolved)
 
-1. Default proxy vendor adapters to ship first-party vs generic URL templates only?  
-2. Is SeleniumBase UC a hard requirement or Playwright-only for MVP?  
-3. Evidence retention default (days) and encryption-at-rest expectations per client?  
-4. Should `robots: ignore` require dual operator attestation in the config?  
-5. Minimum Chromium version matrix for CI Playwright installs?
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | Proxy vendor adapters vs generic? | **Generic HTTP(S) proxy URLs only for MVP.** Operators encode provider geo/session in userinfo. No Bright Data/Oxylabs first-party SDKs until a clear need. |
+| 2 | SeleniumBase UC in MVP? | **Playwright-only** through Phase 2. Dual automation stacks deferred to Phase 4 if required. |
+| 3 | Evidence retention / encryption? | **Local ephemeral artifacts** by default. `ariadne pack --encrypt` (GPG) for client delivery. No cloud retention policy in-tree. |
+| 4 | Dual attestation for `robots: ignore`? | **No.** Operators are already under assumed authorization; avoid administrative nagging in a tactical CLI. |
+| 5 | Minimum Chromium for CI? | Pin to the Playwright-bundled Chromium version for the locked Playwright release in `pyproject.toml`; document in `ariadne doctor`. |
+
+### 20.1 Remaining open (non-blocking)
+
+1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP).  
+2. Exact curl_cffi impersonation profile matrix vs UA pool refresh cadence.  
 
 ---
 
 ## 21. Next implementation step
 
-Upon approval of this specification, implement **Phase 1**: Scrapy project scaffolding, engagement schema validation, ScopeMiddleware, PersonaHeadersMiddleware, curl_cffi L1 handler, proxy + backoff middlewares, Map/Extract spiders, and NDJSON artifacts — with tests against local fixtures.
+Implement **Phase 1** against this v1.1 spec:
+
+1. Scaffold Scrapy project with **mandatory `AsyncioSelectorReactor`**.  
+2. Engagement schema validation (`respect_robots: observe` default).  
+3. In-process Session Sync + Scope / Persona / Proxy middlewares.  
+4. curl_cffi L1 handler with TLS **and** HTTP/2 impersonation bound to persona.  
+5. Backoff, robots observe + `RobotsHintItem`, Map/Extract spiders, NDJSON artifacts.  
+6. Tests: reactor guard, persona coherence, honeypot deferral stub, local fixtures.
+
+Phase 2 then adds Browser Pool, WebRTC/DNS OPSEC hardens, and L1↔L2 clearance handoff tests.
