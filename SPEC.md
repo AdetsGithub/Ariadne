@@ -1,8 +1,8 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.1.0  
-**Status:** Draft for implementation (revised after architecture / OPSEC review)  
+**Version:** 1.2.1  
+**Status:** Ready for Phase 1 implementation  
 **Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
@@ -38,11 +38,14 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 2. **Progressive fidelity** — start cheap (HTTP + TLS/HTTP2 impersonation); escalate to fortified browsers only when needed.
 3. **Layered evasion** — no single technique is sufficient; IP, TLS, HTTP/2, headers, fingerprint, and behavior must align.
 4. **Session coherence** — L1↔L2 handoff shares one persona (UA, Client Hints, cookies, proxy sticky ID); clearance cookies are worthless without matching fingerprints.
-5. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
-6. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
-7. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
-8. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
-9. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
+5. **Profile-sourced personas** — `curl_cffi` impersonation profiles are the source of truth; UA / Client Hints / viewport are derived from the chosen profile, never the reverse.
+6. **Non-blocking escalation** — L1→L2 never holds a Scrapy downloader slot waiting on the Browser Pool; escalate by re-scheduling into the engine queue.
+7. **One solver per session** — Session Sync mutex ensures a single in-flight WAF solve per `session_id` (no thundering herd).
+8. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
+9. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
+10. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
+11. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
+12. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
 
 ---
 
@@ -107,6 +110,9 @@ Use `obey` only when the ROE or client explicitly requires crawl-delay / disallo
 | G7 | Remain operable when DOM structure drifts | Health checks / canary URLs; selector fallbacks; alert on extraction failure rate |
 | G8 | Preserve session coherence across L1↔L2 | Clearance cookies acquired in L2 remain valid when traffic returns to L1 |
 | G9 | No host IP leakage via DNS/WebRTC | Proxy-forced DNS; WebRTC disabled; leak canary tests pass |
+| G10 | Escalate without starving L0/L1 concurrency | Challenge storms free downloader slots via re-schedule; L1 traffic continues |
+| G11 | Single WAF solve per session | Concurrent challenges for one `session_id` coalesce behind a session mutex |
+| G12 | Fingerprint internal consistency | Every persona is derived from a supported `curl_cffi` profile; no orphan UAs |
 
 ### 3.2 Non-goals
 
@@ -212,7 +218,9 @@ Spinning up a new Chromium + context per request is too slow and burns fingerpri
 | Isolation | No cookie/localStorage bleed across different `session_id`s |
 | Deadlock avoidance | Checkout timeouts; never hold Scrapy downloader slots while waiting unbounded; release on cancel/errback |
 | Recycling | Contexts recycled after N pages, idle TTL, or clearance invalidation |
-| Scheduler interaction | Download handler awaits checkout with timeout; on timeout → retry later or escalate policy, do not block reactor |
+| Root browser recycle | After **MaxContextsServed** (e.g. 5,000) on a Chromium process: spawn a second browser, route new checkouts there, drain old contexts, then `browser.close()` the drained process (Chromium process-level leak mitigation) |
+| Graceful teardown | `BrowserPoolExtension` MUST handle `engine_stopped` and trap SIGINT/SIGTERM to `await browser.close()` on all pooled browsers **before** the asyncio reactor finalizes — prevents zombie Chromium after cancelled runs |
+| Scheduler interaction | Download handler awaits checkout with **short** timeout only for requests **already** marked `meta['transport_mode']=L2` and scheduled as L2; never block an L1 slot awaiting pool capacity (see §5.5) |
 
 Pool lifecycle is owned by a Scrapy extension started in `spider_opened` and torn down in `spider_closed`.
 
@@ -223,22 +231,51 @@ Progressive escalation fails in practice when L1 and L2 do not share state. A de
 | Field | Purpose |
 | --- | --- |
 | `session_id` | Stable ID tying sticky proxy + persona + cookie jar |
-| `persona` | UA, Client Hints, locale, timezone, viewport, curl_cffi impersonation profile name |
+| `persona` | Derived from a supported `curl_cffi` profile (§7.2): profile id, UA, Client Hints, locale, timezone, viewport |
 | `cookie_jar` | Normalized cookie store (incl. `cf_clearance`, `_abck`, etc.) |
 | `proxy_endpoint` | Sticky proxy URL / session tag |
 | `clearance_meta` | How clearance was obtained (L2), TTL estimate, last validated |
-| `tls_profile` | Impersonation id that **must** match persona UA family |
-| `h2_profile` | HTTP/2 fingerprint expectations tied to the same browser claim |
+| `tls_profile` / `h2_profile` | Impersonation id — **identical** to the persona’s source `curl_cffi` profile |
+| `challenge_state` | `idle` \| `solving` \| `solved` \| `failed` — gates concurrent escalations |
+| `challenge_lock` | Per-`session_id` async mutex / exclusive lease for WAF solves |
 
 **Handoff rules (MUST):**
 
-1. On L1 challenge → escalate to L2 **with the same `session_id`**.  
-2. L2 solves challenge using that session’s persona + sticky proxy.  
-3. L2 writes cookies / storage state back to Session Sync before returning the response.  
-4. Subsequent L1 requests for that `session_id` load the synced jar and **identical** UA / Client Hints / TLS+H2 impersonation profile.  
-5. If persona and clearance fingerprints diverge, invalidate clearance and re-escalate (do not silently send mismatched L1 traffic).  
+1. On L1 challenge → escalate to L2 **with the same `session_id`** via **non-blocking re-schedule** (§5.5), never by awaiting L2 inside the L1 downloader slot.  
+2. Before starting an L2 solve, acquire the session **challenge lock** (§5.3.1).  
+3. L2 solves challenge using that session’s persona + sticky proxy.  
+4. L2 writes cookies / storage state back to Session Sync before releasing the lock and marking `challenge_state=solved`.  
+5. Subsequent L1 requests for that `session_id` load the synced jar and **identical** profile-derived UA / Client Hints / TLS+H2 impersonation.  
+6. If persona and clearance fingerprints diverge, invalidate clearance and re-escalate (do not silently send mismatched L1 traffic).  
+7. **Proxy burn / IP bind:** Clearance cookies (`cf_clearance`, `_abck`, etc.) are bound to the client IP. If the sticky proxy is burned (repeated TCP timeouts, instant 403s without a JS challenge body, provider soft-ban), Session Sync MUST: drop clearance cookies + storage state → rotate sticky proxy endpoint → **keep the same persona/profile** → set `challenge_state=idle` → force full L2 re-escalate on the next request for that `session_id`. Never reuse clearance on a new IP.  
 
 Without this service, `cf_clearance` acquired in Playwright is invalidated the moment `curl_cffi` resumes with a different JA3/UA.
+
+#### 5.3.1 Session challenge mutex (thundering herd prevention)
+
+If N concurrent L1 requests share `session_id_A` and all hit Cloudflare Turnstile, a naive design escalates all N to L2 — burning CAPTCHA budget, looping challenges on the same sticky IP, and racing `set_cookies` writes.
+
+**MUST:**
+
+1. `try_begin_challenge(session_id) -> bool` — atomically transitions `idle|failed → solving` and grants the lock to exactly one waiter; returns `false` if already `solving`.  
+2. The lock holder is the **only** request allowed to checkout an L2 context for solving that session’s WAF.  
+3. Sibling requests that lose the race MUST **re-schedule** with jittered delay (`meta['waiting_for_clearance']=True`), free their downloader slot, and retry L1 after `challenge_state` becomes `solved` (or re-compete if `failed`).  
+4. Lock lease has a TTL (configurable, e.g. 120s); expired leases auto-fail to `failed` so the crawl cannot deadlock.  
+5. Cookie jar writes during `solving` are exclusive to the lock holder; others must not mutate clearance cookies.  
+
+```text
+L1 × N hit challenge for session_A
+        │
+        ▼
+ try_begin_challenge(A)?
+   │              │
+  yes             no
+   │              │
+   ▼              ▼
+ re-schedule     re-schedule with delay
+ escalate_to=L2  waiting_for_clearance=True
+ (single solve)  (poll / retry L1 after solved)
+```
 
 ### 5.4 Progressive downloader strategy
 
@@ -254,6 +291,43 @@ Requests flow through escalating transport modes:
 Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatures, Cloudflare interstitial HTML, empty SPA shells, CAPTCHA iframes, DataDome deny pages, soft-block patterns (delayed empty responses).
 
 De-escalation (L2 → L1) is allowed **only** after Session Sync confirms clearance + persona coherence.
+
+### 5.5 Non-blocking escalation (concurrency starvation fix)
+
+Scrapy’s `CONCURRENT_REQUESTS` limits **in-flight downloader slots**. If ChallengeDetect awaits Browser Pool checkout inside the L1 response path, a challenge storm fills every slot with waiters and **starves all remaining L0/L1 work**.
+
+**MUST NOT:** block a downloader slot while waiting for an L2 context.
+
+**MUST (escalation algorithm):**
+
+1. `ChallengeDetectMiddleware.process_response` classifies a challenge on an L0/L1 response.  
+2. Emit a `DefenseEvent`; call `try_begin_challenge(session_id)` when a solve is needed.  
+3. Build a **new** `Request` (or clone) with:
+   - `meta['transport_mode'] = 'L2_browser'` (or `L3_unlocker`)
+   - `meta['escalate_from'] = prior mode`
+   - `meta['session_id']` unchanged
+   - `dont_filter=True` **or** fingerprint includes mode (§5.6) so the DupeFilter does not drop it
+   - **`priority` MUST be elevated** (default `ARIADNE_ESCALATION_PRIORITY=100`, configurable) — **not optional**. Deep Scrapy queues (tens of thousands of L1 URLs) will otherwise bury the L2 solve until after `challenge_lease_ttl` expires, breaking the mutex and deadlocking clearance waiters. Sibling `waiting_for_clearance` retries MUST use the same high priority (or a dedicated high-priority / LIFO path) so they run inside the lease window.  
+4. **Yield / return the new Request** to the engine (via `Response.request` replacement patterns or errback/callback that schedules it — implementation may use `scrapy.Request` returned from middleware where supported, or spider callback re-schedule; the invariant is: **drop the current download and free the slot**).  
+5. Do **not** call Playwright or `pool.checkout()` from L1 middleware. Only the L2 download handler, on an already-scheduled L2 request, may checkout.  
+6. If `try_begin_challenge` returns `false`, re-schedule the **same URL** as L1 (or a lightweight “wait”) with `waiting_for_clearance=True`, **high priority**, and short delay — still freeing the slot.  
+
+Pool saturation on genuine L2 traffic: L2 download handler uses checkout **timeout**; on timeout, re-schedule the L2 request with **high priority** + delay (again freeing the slot) rather than waiting unbounded.
+
+### 5.6 Request fingerprinting & deduplication
+
+Escalating L1 → L2 requests the **same URL twice**. Scrapy’s default `RFPDupeFilter` fingerprints method + URL + body and **silently drops** the L2 retry.
+
+**MUST** implement `ariadne.dupefilters.TransportAwareDupeFilter` (or equivalent) such that:
+
+| Approach | Rule |
+| --- | --- |
+| Preferred | Include `transport_mode` (and optionally `session_id` for auth-bound URLs) in the request fingerprint hash |
+| Required fallback | Escalation-scheduled requests set `dont_filter=True` |
+
+Also treat `waiting_for_clearance` retries as intentionally repeatable: either `dont_filter=True` or a fingerprint salt (`clearance_epoch` from Session Sync) so post-solve L1 fetches are not dropped.
+
+`DUPEFILTER_CLASS` MUST be set in scaffolding settings; tests MUST prove an L2 escalate of a seen L1 URL is not discarded.
 
 ---
 
@@ -278,7 +352,7 @@ De-escalation (L2 → L1) is allowed **only** after Session Sync confirms cleara
 | TLS + HTTP/2 impersonation | **curl_cffi** | Chrome/Firefox JA3/JA4 **and** H2 SETTINGS/pseudo-header profiles for L1 |
 | Browser automation | **Playwright** (Python) only for MVP | L2 JS rendering, interaction, network capture |
 | Stealth | playwright-stealth / equivalent patches | Mask `webdriver` and common automation leaks |
-| Fingerprint profiles | curated UA + Client Hints + viewport + H2 profile pools | Consistent persona per session |
+| Fingerprint profiles | `stealth/profiles.yaml` catalog keyed by curl_cffi profile id | UA/CH/viewport **derived from** profile; never invent UAs |
 | Humanization | custom helpers on pooled contexts | Behavioral noise |
 | Session Sync | in-process service (Phase 1–2); optional Redis later | Shared jar/persona across transports |
 
@@ -342,21 +416,30 @@ No built-in cloud retention policy in MVP.
 | `canary` | Periodic health checks against known selectors for drift detection |
 | `passive` | Headers/cookies/CSP/tech only; no deep link follow |
 
-### 7.2 Request authenticity (HTTP layer)
+### 7.2 Request authenticity (HTTP layer) & persona generation
 
-**MUST:**
+**Persona source of truth (MUST — reverse dependency):**
 
-1. Rotate User-Agents from a **current** browser version pool (stale UAs are themselves a signal).  
-2. Emit complete browser-like headers: `Accept`, `Accept-Language`, `Accept-Encoding`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`, `Sec-CH-UA*` when claiming Chromium.  
-3. Keep **UA ↔ Client Hints ↔ TLS impersonation ↔ HTTP/2 profile** internally consistent (Session Sync enforces this).  
-4. Set realistic `Referer` (Google locale-matched, or same-site navigation referrer).  
-5. Support cookie jar persistence per sticky session (including `cf_clearance` reuse within TTL) via Session Sync.  
-6. When using L1 `curl_cffi`, select an impersonation profile that matches **both** TLS (JA3/JA4) **and** HTTP/2 fingerprint (SETTINGS / window / pseudo-header order) of the claimed browser — not TLS alone.  
+You cannot pick a random User-Agent and ask `curl_cffi` to match it. Impersonation profiles are **pre-compiled** browser builds (e.g. `chrome120`, `chrome124`). A Chrome 126 UA with a Chrome 124 TLS/H2 stack is an instant Akamai/CF inconsistency kill.
+
+1. Enumerate **supported** `curl_cffi` impersonation profile IDs at startup (`ariadne doctor` / Session Sync catalog).  
+2. Session Sync **selects a profile first** (weighted random / sticky per session).  
+3. **Derive** from that profile: exact User-Agent string, `Sec-CH-UA` / `Sec-CH-UA-Mobile` / `Sec-CH-UA-Platform`, Accept-Language defaults, and preferred viewport/window sizes from a profile metadata table maintained in-repo.  
+4. L1 always calls `impersonate=<that profile id>`. L2 Playwright launches with the **same** derived UA and viewport.  
+5. Rotating personas means rotating **among supported profiles**, not inventing UAs outside the catalog.  
+6. When `curl_cffi` adds/removes profiles, update the metadata table; CI fails if the catalog references unknown profile IDs.
+
+**Additional MUST:**
+
+7. Emit complete browser-like headers consistent with the derived persona: `Accept`, `Accept-Language`, `Accept-Encoding`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`.  
+8. Set realistic `Referer` (Google locale-matched, or same-site navigation referrer).  
+9. Support cookie jar persistence per sticky session via Session Sync.  
+10. L1 impersonation MUST apply the profile’s TLS **and** HTTP/2 fingerprint — not TLS alone.  
 
 **SHOULD:**
 
-7. Randomize viewport and locale in concert with proxy geolocation.  
-8. Prefer HTTP/2 when impersonating modern Chrome (and fail tests if H2 fingerprint diverges from profile).  
+11. Align locale/timezone with proxy geo when the sticky proxy encoding supports it.  
+12. Fail contract tests if observed JA3/H2 characteristics diverge from the selected profile’s expectations.
 
 ### 7.3 Proxy, DNS & OPSEC
 
@@ -429,9 +512,12 @@ Inline-style / obvious trap heuristics still apply on L1 before deferral.
 1. Detect challenge pages (signature matchers for Cloudflare, DataDome, Akamai, reCAPTCHA, hCaptcha, Turnstile).  
 2. Prefer **avoidance** (better IP/behavior) over solving.  
 3. Pluggable solver interface (2Captcha / Anti-Captcha / CapSolver / unlocker API).  
-4. After solve, write clearance into Session Sync and keep sticky proxy + persona for that `session_id`.  
-5. Budget caps: max solves per run; alert when exceeded.  
-6. On de-escalate to L1, verify persona/TLS/H2 still match the solving session (§5.3).  
+4. Escalate via **non-blocking re-schedule** (§5.5); never await L2 inside an L1 downloader slot.  
+5. Enforce **one in-flight solve per `session_id`** via Session Sync challenge mutex (§5.3.1).  
+6. After solve, write clearance into Session Sync, set `challenge_state=solved`, release lock, keep sticky proxy + profile-derived persona.  
+7. Budget caps: max solves per run; alert when exceeded.  
+8. On de-escalate to L1, verify profile/TLS/H2 still match the solving session (§5.3).  
+9. Sibling requests waiting on clearance MUST NOT open additional L2 contexts for the same session.
 
 ### 7.8 Security recon outputs
 
@@ -473,9 +559,9 @@ When network capture or static JS analysis reveals backend JSON endpoints that s
 
 | Category | Requirement |
 | --- | --- |
-| Performance | L0/L1: hundreds of concurrent requests (proxy-limited). L2: capped concurrent **checked-out** contexts from the pool |
-| Event loop | No blocking calls on the asyncio reactor; Playwright work must be awaited |
-| Reliability | Idempotent retries; resume from jobdir / queue snapshot; Session Sync durable for run lifetime |
+| Performance | L0/L1: hundreds of concurrent requests (proxy-limited). L2: capped concurrent **checked-out** contexts from the pool. `CONCURRENT_REQUESTS` may exceed pool size; escalation must not couple them |
+| Event loop | No blocking calls on the asyncio reactor; Playwright work must be awaited; challenge waits must be re-schedules, not in-slot sleeps |
+| Reliability | Idempotent retries; resume from jobdir / queue snapshot; Session Sync durable for run lifetime; challenge lock leases expire |
 | Disk I/O | Default NDJSON-only; HAR/screenshots conditional to avoid multi-GB exhaustion on large maps |
 | Security / OPSEC | No secrets in repo; PII redaction; TLS verify on; DNS/WebRTC leak protections |
 | Portability | Linux primary; Docker image with Playwright deps |
@@ -514,12 +600,17 @@ crawl:
   transport:
     initial_mode: L1_impersonate
     escalate_to: [L2_browser, L3_unlocker]
-    # curl_cffi profile must match persona UA + HTTP/2 fingerprint
-    impersonate: chrome131
+    # Optional allowlist; if omitted, Session Sync picks from full supported catalog.
+    # Personas are ALWAYS derived from these profiles — never invent UAs outside the catalog.
+    impersonate_profiles: [chrome124, chrome131, firefox133]
   concurrency:
     max_concurrent_requests: 8
     download_delay_mean: 3.5
     download_delay_std: 1.2
+  session:
+    challenge_lease_ttl_seconds: 120
+    clearance_wait_delay_mean: 2.0
+    escalation_priority: 100       # mandatory high priority for L2 + clearance waiters
   browser:
     headless: false
     stealth: true
@@ -527,6 +618,7 @@ crawl:
     capture_network: true      # apisnoop / conditional HAR
     pool_size: 4               # max concurrent BrowserContexts
     checkout_timeout_seconds: 60
+    max_contexts_served: 5000  # recycle root Chromium process after this many contexts
     disable_webrtc: true       # mandatory default
     proxy_dns: true            # mandatory when proxy set
   honeypot:
@@ -562,7 +654,9 @@ Proxy credentials via env, e.g. `ARIADNE_PROXY_URL` or `ARIADNE_PROXY_LIST_FILE`
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 ```
 
-Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES_ENABLED` (jar ultimately owned by Session Sync), `RETRY_HTTP_CODES`, middleware order, Playwright launch options, curl_cffi `impersonate` profile, browser pool size / checkout timeout.
+Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES_ENABLED` (jar ultimately owned by Session Sync), `RETRY_HTTP_CODES`, middleware order, Playwright launch options, `DUPEFILTER_CLASS = "ariadne.dupefilters.TransportAwareDupeFilter"`, browser pool size / checkout timeout, challenge lease TTL.
+
+> Note: Raising `CONCURRENT_REQUESTS` above Browser Pool size is expected and safe **because** escalation re-schedules instead of awaiting checkout in-slot. Pool size caps only true L2 parallelism, not total crawl concurrency.
 
 ---
 
@@ -582,14 +676,33 @@ Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES
 ### 10.2 Middlewares (Downloader)
 
 1. **ScopeMiddleware** — drop OOS requests early  
-2. **SessionSyncMiddleware** — attach `session_id`, load persona + cookies onto request meta  
-3. **PersonaHeadersMiddleware** — header bundles from Session Sync persona  
-4. **TlsHttp2ImpersonateHandler** — L1 via curl_cffi (TLS + H2)  
+2. **SessionSyncMiddleware** — attach `session_id`, load profile-derived persona + cookies onto request meta; if `waiting_for_clearance` and state still `solving`, re-schedule with delay (free slot)  
+3. **PersonaHeadersMiddleware** — header bundles from Session Sync persona (never ad-hoc UAs)  
+4. **TlsHttp2ImpersonateHandler** — L1 via curl_cffi using `persona.impersonate_id`  
 5. **ProxyMiddleware** — rotate / sticky / geo; enforce proxy-DNS policy  
 6. **BackoffMiddleware** — 429/403/503 policy  
-7. **ChallengeDetectMiddleware** — classify blocks; request L2 escalation with same `session_id`  
-8. **PlaywrightPoolDownloadHandler** — L2 via Browser Pool checkout  
+7. **ChallengeDetectMiddleware** — classify blocks; on L0/L1 challenge: `try_begin_challenge` → **yield re-scheduled L2 (or wait) Request** and drop current response path (§5.5); never `await pool.checkout()` here  
+8. **PlaywrightPoolDownloadHandler** — runs **only** for requests already at `transport_mode=L2`; checkout pool; lock holder performs solve; sync cookies; release challenge lock  
 9. **HoneypotFilterMiddleware** — filter / defer unverified L1 links  
+
+### 10.2.1 Escalation control flow (normative)
+
+```text
+L1 response → ChallengeDetect
+    │
+    ├─ not challenge → pass through
+    │
+    └─ challenge
+         ├─ try_begin_challenge(session)?
+         │     yes → schedule Request(url, mode=L2, dont_filter/mode-aware fingerprint)
+         │           return/drop to FREE downloader slot
+         │     no  → schedule Request(url, mode=L1, waiting_for_clearance, delay)
+         │           return/drop to FREE downloader slot
+         │
+L2 request (later) → PlaywrightPoolDownloadHandler
+         → checkout context → solve → SessionSync.set_cookies
+         → challenge_state=solved → release lock → return Response
+```
 
 ### 10.3 Middlewares (Spider)
 
@@ -610,23 +723,49 @@ Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES
 
 1. Engagement banner (logs authorization metadata at start)  
 2. **AsyncioReactorGuard** — abort if wrong reactor  
-3. **BrowserPoolExtension** — start/stop pool  
-4. **SessionSyncExtension** — process-lifetime session store  
+3. **BrowserPoolExtension** — start/stop pool; **MUST** close all Playwright browsers on `engine_stopped` and on SIGINT/SIGTERM before reactor teardown (no zombie Chromium); recycle root browser after MaxContextsServed  
+4. **SessionSyncExtension** — process-lifetime session store; expose `burn_proxy(session_id)` for sticky-IP death → drop clearance → rotate proxy → re-escalate  
 5. Kill-switch watcher  
-6. Metrics exporter (include pool wait time, escalation counts)  
+6. Metrics exporter (include pool wait time, escalation counts, challenge-lock waiters, re-schedule rate, browser process recycles)  
 7. Canary scheduler  
 
-### 10.6 Session Synchronization Service (API sketch)
+### 10.6 DupeFilter
+
+| Component | Responsibility |
+| --- | --- |
+| `TransportAwareDupeFilter` | Fingerprint includes `transport_mode` (+ optional `clearance_epoch`); configured as `DUPEFILTER_CLASS` |
+
+Escalation paths MUST still set `dont_filter=True` as belt-and-suspenders during Phase 1 until fingerprint tests are green.
+
+### 10.7 Session Synchronization Service (API sketch)
 
 ```text
+# Persona factory (profile → headers), never UA → profile
+list_impersonate_profiles() -> list[ProfileMeta]
+create_persona_from_profile(profile_id) -> Persona
+
 get_or_create(session_id | host) -> Session
-bind_persona(session, persona)
+bind_persona(session, persona)          # persona must reference a known profile_id
 get_cookies(session) / set_cookies(session, cookies)
-get_storage_state(session) / set_storage_state(...)   # Playwright format
+get_storage_state(session) / set_storage_state(...)
 invalidate_clearance(session, reason)
-assert_coherent(session) -> bool   # UA/TLS/H2/cookie constraints
+assert_coherent(session) -> bool        # profile_id ↔ UA ↔ TLS/H2 ↔ cookies
+
+# Challenge mutex
+try_begin_challenge(session_id, lease_ttl) -> bool
+release_challenge(session_id, state: solved|failed)
+get_challenge_state(session_id) -> idle|solving|solved|failed
+clearance_epoch(session_id) -> int      # bumped on each successful solve; salts dupe fingerprints
+
+# Proxy burn (IP-bound clearance)
+burn_sticky_proxy(session_id, reason) -> Session
+  # drops clearance + storage; rotates proxy endpoint; keeps persona;
+  # challenge_state=idle; next fetch must L2 re-escalate
 ```
 
+### 10.8 Profile metadata catalog
+
+Ship `ariadne/stealth/profiles.yaml` (or similar) mapping each supported `curl_cffi` profile id → canonical UA, Client Hints, default viewport. Session Sync refuses personas that are not in this catalog.
 ---
 
 ## 11. Data model (core items)
@@ -681,11 +820,14 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 
 | Layer | What |
 | --- | --- |
-| Unit | Header/persona consistency, honeypot CSS + deferral queue, scope regex, backoff math, redaction, Session Sync coherence checks |
+| Unit | Profile→persona derivation, honeypot deferral, scope regex, backoff, redaction, Session Sync coherence + mutex, fingerprint includes transport_mode |
 | Integration | Local fixtures: static, SPA, rate-limited, honeypot (external CSS), fake Cloudflare interstitial; L1→L2→L1 clearance reuse |
-| Contract | curl_cffi impersonation profile matches UA family **and** expected HTTP/2 fingerprint characteristics |
+| Concurrency | Challenge storm: N>L2-pool L1 challenges must not stall unrelated L0/L1 requests; assert downloader slot frees on escalate |
+| Thundering herd | N concurrent challenges for one `session_id` → exactly one L2 solve; others wait/re-schedule |
+| DupeFilter | L2 escalate of a previously seen L1 URL is not dropped |
+| Contract | Catalog profile IDs ⊆ curl_cffi supported set; derived UA matches profile metadata |
 | Reactor | Boot fails/tests fail if AsyncioSelectorReactor not installed |
-| Pool | Checkout timeout, no deadlock under concurrency saturation, no cross-session cookie bleed |
+| Pool | Checkout timeout re-schedules (no unbounded wait); no cross-session cookie bleed |
 | OPSEC | Leak-check: with proxy set, WebRTC/DNS must not expose host IP |
 | Stealth canary | Optional gated tests against public bot-detection demos; never against third-party production without auth |
 | I/O | Assert HAR/screenshots absent on normal `map` crawl; present on challenge fixture |
@@ -700,11 +842,11 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 
 ### Phase 1 — Scrapy core + L0/L1
 
-- Scope enforcement, Session Sync (in-process), persona headers, curl_cffi TLS+H2 handler, generic proxy middleware (DNS-safe), backoff, robots `observe` + hints, map/extract spiders, NDJSON export, L1 honeypot deferral stubs  
+- Scope enforcement, Session Sync (in-process) with profile→persona factory + challenge mutex stubs, TransportAwareDupeFilter, persona headers, curl_cffi TLS+H2 handler, generic proxy middleware (DNS-safe), backoff, robots `observe` + hints, map/extract spiders, NDJSON export, L1 honeypot deferral stubs, **non-blocking escalate re-schedule skeleton** (even before real L2)  
 
 ### Phase 2 — L2 Playwright pool + recon
 
-- Browser Pool + checkout manager, WebRTC disabled + proxy DNS, humanization, network capture (`apisnoop`), Session Sync L1↔L2 handoff, honeypot visibility validation queue, conditional screenshots, defense event taxonomy  
+- Browser Pool + checkout manager, WebRTC disabled + proxy DNS, humanization, network capture (`apisnoop`), Session Sync L1↔L2 handoff with mutex, challenge-storm concurrency tests, honeypot visibility validation queue, conditional screenshots, defense event taxonomy  
 
 ### Phase 3 — Hardening & scale
 
@@ -720,18 +862,22 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 
 1. Given a valid engagement YAML, Ariadne refuses to crawl out-of-scope hosts.  
 2. Process runs on `AsyncioSelectorReactor`; `ariadne doctor` detects misconfiguration.  
-3. L1 requests present browser-consistent TLS **and** HTTP/2 fingerprints (contract tests).  
-4. On JS-rendered fixture SPA, L2 extracts items that L0/L1 cannot.  
-5. L1→L2 challenge solve → L1 reuse succeeds on fixture **only when** Session Sync keeps persona+cookies coherent; mismatched persona test fails closed.  
-6. Browser Pool reuses contexts; per-request browser launch is not the default path.  
-7. Honeypot fixture with **external CSS** is not followed from L1 without L2 validation (defer policy).  
-8. With proxy configured, leak-check passes (no host IP via WebRTC/DNS).  
-9. 429 responses respect `Retry-After` and jittered exponential backoff.  
-10. `apisnoop` emits EndpointItems from XHR; HAR exists for that mode; normal `map` does not write per-page HAR/PNG.  
-11. `respect_robots: observe` records `RobotsHintItem`s and still crawls Disallow paths in scope.  
-12. Kill-switch stops scheduling new requests within 5 seconds.  
-13. `ariadne pack --encrypt` produces a client-deliverable archive.  
-14. Unit + integration tests pass in CI without live target dependence.
+3. Every session persona is derived from a supported `curl_cffi` profile; inventing a UA outside the catalog is impossible via public APIs.  
+4. L1 requests present browser-consistent TLS **and** HTTP/2 fingerprints for that profile (contract tests).  
+5. On JS-rendered fixture SPA, L2 extracts items that L0/L1 cannot.  
+6. L1→L2 challenge solve → L1 reuse succeeds on fixture **only when** Session Sync keeps profile+cookies coherent; mismatched persona test fails closed.  
+7. Browser Pool reuses contexts; per-request browser launch is not the default path.  
+8. **Concurrency:** with `CONCURRENT_REQUESTS=16` and `pool_size=4`, a synthetic challenge storm on many URLs does not prevent unrelated non-challenge L1 requests from completing (escalation frees slots via re-schedule).  
+9. **Thundering herd:** N concurrent challenges for one `session_id` result in exactly one L2 solve attempt; siblings wait on clearance.  
+10. **DupeFilter:** re-scheduled L2 request for a URL already fetched at L1 is not silently dropped.  
+11. Honeypot fixture with **external CSS** is not followed from L1 without L2 validation (defer policy).  
+12. With proxy configured, leak-check passes (no host IP via WebRTC/DNS).  
+13. 429 responses respect `Retry-After` and jittered exponential backoff.  
+14. `apisnoop` emits EndpointItems from XHR; HAR exists for that mode; normal `map` does not write per-page HAR/PNG.  
+15. `respect_robots: observe` records `RobotsHintItem`s and still crawls Disallow paths in scope.  
+16. Kill-switch stops scheduling new requests within 5 seconds.  
+17. `ariadne pack --encrypt` produces a client-deliverable archive.  
+18. Unit + integration tests pass in CI without live target dependence.
 
 ---
 
@@ -740,9 +886,13 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Twisted/asyncio impedance | Timeouts, deadlocks | Mandatory AsyncioSelectorReactor; non-blocking pool checkout |
+| Downloader slot starvation on escalate | Engine freeze under WAF storms | Re-schedule L2; never await pool inside L1 middleware (§5.5) |
+| Challenge thundering herd | Wasted solves, IP challenge loops, cookie races | Per-session challenge mutex (§5.3.1) |
+| RFPDupeFilter drops L2 retry | Silent “success” with no bypass | TransportAwareDupeFilter + `dont_filter` on escalate (§5.6) |
+| UA/profile mismatch | Instant Akamai/CF block | Profile-sourced personas only (§7.2) |
 | L1↔L2 clearance invalidation | Challenge storms, wasted residential bandwidth | Session Sync coherence asserts before de-escalation |
 | DNS/WebRTC leak | OPSEC failure, ROE incident | Proxy DNS + WebRTC disabled; leak-check in doctor |
-| HTTP/2 fingerprint drift | Silent Akamai/CF blocks despite good TLS | curl_cffi profile contract tests; persona↔profile binding |
+| HTTP/2 fingerprint drift | Silent Akamai/CF blocks despite good TLS | curl_cffi profile contract tests; catalog binding |
 | L1 honeypot follows | Immediate bot flag | Defer unverified links to L2 validation queue |
 | HAR/PNG on every page | Disk/I/O collapse on large scopes | Conditional capture defaults |
 | Anti-bot vendors evolve weekly | Sudden success-rate drop | Progressive modes + unlocker fallback; canary alerts |
@@ -780,15 +930,16 @@ Ariadne/
 │   ├── cli.py
 │   ├── settings.py         # AsyncioSelectorReactor mandated here
 │   ├── items.py
-│   ├── session/            # Session Synchronization Service
+│   ├── session/            # Session Synchronization Service + challenge mutex
 │   ├── browser/            # Browser Pool + checkout manager
+│   ├── dupefilters/        # TransportAwareDupeFilter
+│   ├── stealth/            # profiles.yaml catalog (profile → UA/CH/viewport)
 │   ├── spidermiddlewares/
 │   ├── downloadermiddlewares/
 │   ├── downloadhandlers/   # curl_cffi (TLS+H2), playwright pool
 │   ├── pipelines/
 │   ├── extensions/
 │   ├── proxies/            # generic proxy URL helpers (no vendor SDKs in MVP)
-│   ├── stealth/
 │   ├── challenges/
 │   ├── spiders/
 │   └── reporting/
@@ -813,7 +964,9 @@ This specification consolidates practices described in contemporary scraping / a
 | [Bright Data — Scraping without getting blocked](https://brightdata.com/blog/web-data/web-scraping-without-getting-blocked) | Layered detection, residential/mobile vs datacenter, Sec-Fetch headers, curl_cffi TLS impersonation, stealth Playwright, Gaussian delays, CAPTCHA automation, honeypots, exponential backoff, geo matching, prefer internal APIs, vendor-specific notes (CF/Akamai/DataDome/PX) |
 | [ScrapFly — Undetected ChromeDriver](https://scrapfly.io/blog/posts/web-scraping-without-blocking-using-undetected-chromedriver) | UC patches vs stock Selenium, proxy attachment limits, headed vs headless stealth tradeoffs, limits against advanced antibots, managed ASP fallbacks |
 
-v1.1 additionally incorporates internal red-team review on Twisted/asyncio impedance, L1↔L2 session handoff, DNS/WebRTC OPSEC, HTTP/2 frame fingerprints, L1 honeypot deferral, robots `observe` default, and conditional evidence I/O.
+v1.1 additionally incorporated internal red-team review on Twisted/asyncio impedance, L1↔L2 session handoff, DNS/WebRTC OPSEC, HTTP/2 frame fingerprints, L1 honeypot deferral, robots `observe` default, and conditional evidence I/O.
+
+v1.2 incorporates Scrapy execution review: non-blocking escalation (downloader slot starvation), per-session challenge mutex (thundering herd), transport-aware DupeFilter, and profile-sourced persona generation.
 
 ---
 
@@ -826,23 +979,33 @@ v1.1 additionally incorporates internal red-team review on Twisted/asyncio imped
 | 3 | Evidence retention / encryption? | **Local ephemeral artifacts** by default. `ariadne pack --encrypt` (GPG) for client delivery. No cloud retention policy in-tree. |
 | 4 | Dual attestation for `robots: ignore`? | **No.** Operators are already under assumed authorization; avoid administrative nagging in a tactical CLI. |
 | 5 | Minimum Chromium for CI? | Pin to the Playwright-bundled Chromium version for the locked Playwright release in `pyproject.toml`; document in `ariadne doctor`. |
+| 6 | Escalate by awaiting L2 in middleware? | **No.** Always re-schedule; free the downloader slot (§5.5). |
+| 7 | Concurrent solves per session? | **Exactly one** via challenge mutex (§5.3.1). |
+| 8 | How to avoid DupeFilter dropping L2? | **TransportAwareDupeFilter** + `dont_filter=True` on escalate (§5.6). |
+| 9 | UA vs curl_cffi profile precedence? | **Profile is source of truth;** derive UA/Client Hints from catalog (§7.2). |
+| 10 | Escalation request priority? | **Mandatory high priority** (default 100) so L2 solves beat deep L1 queues within lease TTL. |
+| 11 | Sticky proxy burned / IP change? | Drop clearance, rotate proxy, keep persona, full L2 re-escalate — never reuse IP-bound cookies. |
+| 12 | Playwright on SIGTERM? | Close all browsers on `engine_stopped` / signal handlers before reactor shutdown. |
+| 13 | Chromium process leaks? | Recycle root browser after MaxContextsServed; drain then kill. |
 
 ### 20.1 Remaining open (non-blocking)
 
-1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP).  
-2. Exact curl_cffi impersonation profile matrix vs UA pool refresh cadence.  
+1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP) — mutex semantics must be distributed if so.  
+2. Whether clearance-wait siblings should use a dedicated low-cost “probe” request or full L1 GET after solve.  
+3. Cadence for refreshing `profiles.yaml` when `curl_cffi` releases new impersonation builds.  
+
+v1.2.1 adds: mandatory escalation priority vs lease TTL, proxy-burn session lifecycle, Playwright zombie teardown, and root Chromium process recycle.
 
 ---
 
 ## 21. Next implementation step
 
-Implement **Phase 1** against this v1.1 spec:
+Implement **Phase 1** against this v1.2.1 spec:
 
-1. Scaffold Scrapy project with **mandatory `AsyncioSelectorReactor`**.  
+1. Scaffold Scrapy project with **mandatory `AsyncioSelectorReactor`** and `TransportAwareDupeFilter`.  
 2. Engagement schema validation (`respect_robots: observe` default).  
-3. In-process Session Sync + Scope / Persona / Proxy middlewares.  
-4. curl_cffi L1 handler with TLS **and** HTTP/2 impersonation bound to persona.  
-5. Backoff, robots observe + `RobotsHintItem`, Map/Extract spiders, NDJSON artifacts.  
-6. Tests: reactor guard, persona coherence, honeypot deferral stub, local fixtures.
-
-Phase 2 then adds Browser Pool, WebRTC/DNS OPSEC hardens, and L1↔L2 clearance handoff tests.
+3. In-process Session Sync: profile catalog → persona factory, challenge mutex API, Scope / Persona / Proxy middlewares.  
+4. curl_cffi L1 handler bound to `persona.impersonate_id` (TLS **and** HTTP/2).  
+5. ChallengeDetect **re-schedule** skeleton (even if L2 is a stub handler initially).  
+6. Backoff, robots observe + `RobotsHintItem`, Map/Extract spiders, NDJSON artifacts.  
+7. Tests: reactor guard, profile→persona, dupefilter escalate, mutex unit tests, local fixtures.
