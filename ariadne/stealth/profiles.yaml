@@ -1,0 +1,63 @@
+# curl_cffi impersonation profiles → derived browser persona fields.
+#
+# TLS ANCHOR (Phase 2): When Playwright is installed, Session Sync ONLY selects profiles
+# whose `chromium_major` matches Playwright's bundled Chromium. L2 cannot spoof JA3/H2;
+# L1 must claim the same browser build or clearance cookies die on handoff.
+#
+# Never invent UAs outside this catalog. Never rotate across majors during an engagement
+# when L2 is enabled.
+
+profiles:
+  chrome124:
+    impersonate: chrome124
+    chromium_major: 124
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  chrome131:
+    impersonate: chrome131
+    chromium_major: 131
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  chrome133:
+    impersonate: chrome133
+    chromium_major: 133
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  # Firefox is L1-only — cannot be used when Playwright Chromium L2 is active.
+  firefox133:
+    impersonate: firefox133
+    chromium_major: null
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+    sec_ch_ua: null
+    sec_ch_ua_mobile: null
+    sec_ch_ua_platform: null
+    accept_language: "en-US,en;q=0.5"
+    viewport:
+      width: 1920
+      height: 1080
+    family: firefox
+    l2_compatible: false
