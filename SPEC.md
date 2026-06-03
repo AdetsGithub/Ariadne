@@ -1,8 +1,8 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.2.1  
-**Status:** Ready for Phase 1 implementation  
+**Version:** 1.3.0  
+**Status:** Phase 1–2 implemented; ready for Phase 3 (CAPTCHA solvers / unlockers / scale)  
 **Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
@@ -29,6 +29,8 @@ Modern targets no longer serve useful content via naive HTTP clients. Anti-bot s
 | Behavioral analysis | Timing, mouse/scroll, navigation graph | Fixed-interval crawlers flagged mid-session |
 | JS challenges / CAPTCHAs | Turnstile, reCAPTCHA v3, hCaptcha | Non-JS clients stuck in challenge loops |
 | Honeypots | Hidden links (`display:none`, white-on-white, external CSS) | Blind L0/L1 crawlers self-incriminate |
+| L1↔L2 TLS mismatch | curl_cffi spoofs JA3; Playwright emits real bundled-Chromium JA3 | Clearance cookies invalidated on handoff when majors diverge |
+| Headless rendering tells | `--headless=new` font/WebGL/viewport discrepancies | Turnstile / Akamai soft-fail despite stealth patches |
 
 Ariadne must defeat or gracefully degrade across these layers **within authorized engagement rules**, while remaining polite enough not to DoS the target.
 
@@ -38,14 +40,17 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 2. **Progressive fidelity** — start cheap (HTTP + TLS/HTTP2 impersonation); escalate to fortified browsers only when needed.
 3. **Layered evasion** — no single technique is sufficient; IP, TLS, HTTP/2, headers, fingerprint, and behavior must align.
 4. **Session coherence** — L1↔L2 handoff shares one persona (UA, Client Hints, cookies, proxy sticky ID); clearance cookies are worthless without matching fingerprints.
-5. **Profile-sourced personas** — `curl_cffi` impersonation profiles are the source of truth; UA / Client Hints / viewport are derived from the chosen profile, never the reverse.
+5. **Playwright Chromium is the TLS anchor (when L2 enabled)** — `curl_cffi` can spoof any JA3; Playwright cannot. Session Sync MUST only select impersonation profiles whose `chromium_major` matches Playwright’s bundled Chromium. UA / Client Hints are derived from that anchored profile — never the reverse, and never rotated across majors during an L2-capable engagement.
 6. **Non-blocking escalation** — L1→L2 never holds a Scrapy downloader slot waiting on the Browser Pool; escalate by re-scheduling into the engine queue.
 7. **One solver per session** — Session Sync mutex ensures a single in-flight WAF solve per `session_id` (no thundering herd).
-8. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
-9. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
-10. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
-11. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
-12. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
+8. **Split pool timeouts** — checkout **queue** timeout (acquire a context) is separate from **execution** timeout (CAPTCHA/solve hold). Never apply the queue timeout to the whole L2 task.
+9. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
+10. **Bounded network capture** — `apisnoop` MUST enforce `MAX_BODY_SIZE`; oversize XHR/fetch bodies are dropped after recording URL/method/headers.
+11. **Headed stealth in containers** — prefer full headed Chromium; Docker MUST provide Xvfb (`xvfb-run`) so headed mode works without a physical display.
+12. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
+13. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
+14. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
+15. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
 
 ---
 
@@ -112,7 +117,11 @@ Use `obey` only when the ROE or client explicitly requires crawl-delay / disallo
 | G9 | No host IP leakage via DNS/WebRTC | Proxy-forced DNS; WebRTC disabled; leak canary tests pass |
 | G10 | Escalate without starving L0/L1 concurrency | Challenge storms free downloader slots via re-schedule; L1 traffic continues |
 | G11 | Single WAF solve per session | Concurrent challenges for one `session_id` coalesce behind a session mutex |
-| G12 | Fingerprint internal consistency | Every persona is derived from a supported `curl_cffi` profile; no orphan UAs |
+| G12 | Fingerprint internal consistency | When L2 enabled, every persona matches Playwright Chromium major; no cross-major rotation |
+| G13 | L1↔L2 TLS coherence | Clearance acquired in L2 remains valid under L1 curl_cffi with the same major |
+| G14 | CAPTCHA solves do not starve the pool | Queue timeout ≠ execution timeout; long solver polls do not kill mid-solve via checkout TTL |
+| G15 | apisnoop memory safety | Bodies over `MAX_BODY_SIZE` never buffered into the Scrapy worker |
+| G16 | Headed stealth in Docker | Container entrypoint uses Xvfb; Playwright `headless=false` by default for stealth engagements |
 
 ### 3.2 Non-goals
 
@@ -141,6 +150,8 @@ Informed by current industry practice (2025–2026 anti-bot landscape):
 8. **Challenges** — Cloudflare Turnstile / JS challenge, reCAPTCHA v3 scores, hCaptcha, Akamai sensor cookies (`_abck`)  
 9. **Honeypots** — CSS-hidden links (inline **or** external stylesheet / JS-applied), off-screen anchors, trap query params  
 10. **Session continuity breaks** — cookie / clearance loss, or clearance reused under a **different** JA3/UA than the solving session  
+11. **L1↔L2 fingerprint divergence** — curl_cffi spoofs Chrome N while Playwright’s binary is Chrome M; WAFs bind clearance to the solving fingerprint  
+12. **Headless detection** — `--headless=new` still fails Turnstile/Akamai canvas, font, and WebGL probes that headed+Xvfb passes  
 
 ### 4.2 Vendor profiles (reference)
 
@@ -220,9 +231,29 @@ Spinning up a new Chromium + context per request is too slow and burns fingerpri
 | Recycling | Contexts recycled after N pages, idle TTL, or clearance invalidation |
 | Root browser recycle | After **MaxContextsServed** (e.g. 5,000) on a Chromium process: spawn a second browser, route new checkouts there, drain old contexts, then `browser.close()` the drained process (Chromium process-level leak mitigation) |
 | Graceful teardown | `BrowserPoolExtension` MUST handle `engine_stopped` and trap SIGINT/SIGTERM to `await browser.close()` on all pooled browsers **before** the asyncio reactor finalizes — prevents zombie Chromium after cancelled runs |
-| Scheduler interaction | Download handler awaits checkout with **short** timeout only for requests **already** marked `meta['transport_mode']=L2` and scheduled as L2; never block an L1 slot awaiting pool capacity (see §5.5) |
+| Scheduler interaction | Download handler awaits checkout with **queue timeout** only for requests **already** marked `meta['transport_mode']=L2`; never block an L1 slot awaiting pool capacity (see §5.5) |
 
-Pool lifecycle is owned by a Scrapy extension started in `spider_opened` and torn down in `spider_closed`.
+#### 5.2.1 Split timeouts — queue vs execution (CAPTCHA pool exhaustion)
+
+Third-party CAPTCHA solvers (Turnstile, DataDome) often take **45–120+ seconds** of API polling. An L2 context blocked on a solver occupies one pool slot for the entire duration.
+
+If `checkout_timeout` (e.g. 60s) is applied to the **whole** L2 task:
+
+1. Concurrent solves on different domains fill the pool.  
+2. Waiting Scrapy L2 requests time out, re-schedule, and storm.  
+3. Worse: the solver may be killed mid-poll when the timeout fires on the holding context.
+
+**MUST separate:**
+
+| Timeout | Setting (example) | Meaning |
+| --- | --- | --- |
+| **Queue / checkout timeout** | `checkout_timeout_seconds: 60` / `ARIADNE_BROWSER_CHECKOUT_TIMEOUT` | Max wait to **acquire** a free context from the semaphore |
+| **Execution timeout** | `execution_timeout_seconds: 180` / `ARIADNE_BROWSER_EXECUTION_TIMEOUT` | Max lifetime **after** acquire (navigation + CAPTCHA solve + sync) |
+
+On queue timeout: re-schedule the L2 request at high priority (§5.5) — do not hold a downloader slot.  
+On execution timeout: release challenge lock as `failed`, free the context, re-schedule or escalate per policy.
+
+Pool lifecycle is owned by a Scrapy extension started in `spider_opened` and torn down in `spider_closed` / `engine_stopped`.
 
 ### 5.3 Session Synchronization Service
 
@@ -231,11 +262,11 @@ Progressive escalation fails in practice when L1 and L2 do not share state. A de
 | Field | Purpose |
 | --- | --- |
 | `session_id` | Stable ID tying sticky proxy + persona + cookie jar |
-| `persona` | Derived from a supported `curl_cffi` profile (§7.2): profile id, UA, Client Hints, locale, timezone, viewport |
+| `persona` | Derived from the **TLS-anchored** catalog profile (§5.3.2 / §7.2): profile id, UA, Client Hints, locale, timezone, viewport, `chromium_major` |
 | `cookie_jar` | Normalized cookie store (incl. `cf_clearance`, `_abck`, etc.) |
 | `proxy_endpoint` | Sticky proxy URL / session tag |
 | `clearance_meta` | How clearance was obtained (L2), TTL estimate, last validated |
-| `tls_profile` / `h2_profile` | Impersonation id — **identical** to the persona’s source `curl_cffi` profile |
+| `tls_profile` / `h2_profile` | Impersonation id — **identical** to the persona’s source `curl_cffi` profile and Playwright Chromium major |
 | `challenge_state` | `idle` \| `solving` \| `solved` \| `failed` — gates concurrent escalations |
 | `challenge_lock` | Per-`session_id` async mutex / exclusive lease for WAF solves |
 
@@ -277,6 +308,22 @@ L1 × N hit challenge for session_A
  (single solve)  (poll / retry L1 after solved)
 ```
 
+#### 5.3.2 Playwright Chromium TLS anchor (L1↔L2 fingerprint reality gap)
+
+**The trap:** `curl_cffi` can impersonate arbitrary browser builds (`chrome120` … `chrome133`). **Playwright cannot.** It uses a physical bundled Chromium binary and emits that binary’s real JA3/HTTP/2 fingerprint. If Session Sync picks `chrome120` for L1 while Playwright ships Chromium 131, L2 solves under Chrome-131 TLS and L1 resumes under Chrome-120 TLS — Akamai/Cloudflare invalidate clearance immediately.
+
+**MUST (when L2 / Browser Pool is enabled):**
+
+1. At startup, detect Playwright’s bundled Chromium **major** version (`ariadne doctor`, Session Sync extension).  
+2. Filter `profiles.yaml` to profiles whose `chromium_major` **exactly equals** that major.  
+3. Refuse to create sessions if no catalog profile matches (fail closed with a clear error — do not silently fall back to a mismatched major).  
+4. Derive UA, `Sec-CH-UA*`, and viewport **from** the anchored profile.  
+5. Do **not** rotate across Chromium majors during an L2-capable engagement. “Rotation” means choosing among sticky sessions that all claim the **same** major (e.g. different sticky proxies), not different Chrome versions.  
+6. Profiles with `l2_compatible: false` (e.g. Firefox) are L1-only and MUST be excluded from the pool when L2 is enabled.  
+7. When Playwright upgrades (e.g. to Chrome 133), the catalog MUST gain a matching `chrome133` curl_cffi profile before L2 engagements proceed.
+
+**When L2 is disabled (L1-only map/extract):** the full catalog (including Firefox) may be used; TLS anchor filtering is not required.
+
 ### 5.4 Progressive downloader strategy
 
 Requests flow through escalating transport modes:
@@ -312,7 +359,7 @@ Scrapy’s `CONCURRENT_REQUESTS` limits **in-flight downloader slots**. If Chall
 5. Do **not** call Playwright or `pool.checkout()` from L1 middleware. Only the L2 download handler, on an already-scheduled L2 request, may checkout.  
 6. If `try_begin_challenge` returns `false`, re-schedule the **same URL** as L1 (or a lightweight “wait”) with `waiting_for_clearance=True`, **high priority**, and short delay — still freeing the slot.  
 
-Pool saturation on genuine L2 traffic: L2 download handler uses checkout **timeout**; on timeout, re-schedule the L2 request with **high priority** + delay (again freeing the slot) rather than waiting unbounded.
+Pool saturation on genuine L2 traffic: L2 download handler uses **queue** checkout timeout; on timeout, re-schedule the L2 request with **high priority** + delay (again freeing the slot) rather than waiting unbounded. CAPTCHA/solve work after acquire is bounded by **execution** timeout (§5.2.1), not the queue timeout.
 
 ### 5.6 Request fingerprinting & deduplication
 
@@ -352,9 +399,10 @@ Also treat `waiting_for_clearance` retries as intentionally repeatable: either `
 | TLS + HTTP/2 impersonation | **curl_cffi** | Chrome/Firefox JA3/JA4 **and** H2 SETTINGS/pseudo-header profiles for L1 |
 | Browser automation | **Playwright** (Python) only for MVP | L2 JS rendering, interaction, network capture |
 | Stealth | playwright-stealth / equivalent patches | Mask `webdriver` and common automation leaks |
-| Fingerprint profiles | `stealth/profiles.yaml` catalog keyed by curl_cffi profile id | UA/CH/viewport **derived from** profile; never invent UAs |
+| Fingerprint profiles | `stealth/profiles.yaml` with `chromium_major` + `l2_compatible` | When L2 on: Playwright Chromium major anchors allowed profiles; UA/CH derived from match |
 | Humanization | custom helpers on pooled contexts | Behavioral noise |
-| Session Sync | in-process service (Phase 1–2); optional Redis later | Shared jar/persona across transports |
+| Session Sync | in-process service; optional Redis later | Shared jar/persona; TLS-anchor filter at init |
+| Container stealth | Docker + **Xvfb** (`xvfb-run`) | Headed Chromium without a physical display |
 
 > **Out of MVP:** Selenium, undetected-chromedriver, SeleniumBase UC. A single browser stack keeps Phase 2 surface area manageable. Revisit only in Phase 4 if Playwright stealth is insufficient for specific targets.
 
@@ -418,28 +466,32 @@ No built-in cloud retention policy in MVP.
 
 ### 7.2 Request authenticity (HTTP layer) & persona generation
 
-**Persona source of truth (MUST — reverse dependency):**
+**Persona source of truth — reverse dependency with Playwright TLS anchor:**
 
-You cannot pick a random User-Agent and ask `curl_cffi` to match it. Impersonation profiles are **pre-compiled** browser builds (e.g. `chrome120`, `chrome124`). A Chrome 126 UA with a Chrome 124 TLS/H2 stack is an instant Akamai/CF inconsistency kill.
+You cannot pick a random User-Agent and ask `curl_cffi` to match it. Impersonation profiles are **pre-compiled** browser builds. A Chrome 126 UA with a Chrome 124 TLS/H2 stack is an instant Akamai/CF inconsistency kill.
 
-1. Enumerate **supported** `curl_cffi` impersonation profile IDs at startup (`ariadne doctor` / Session Sync catalog).  
-2. Session Sync **selects a profile first** (weighted random / sticky per session).  
-3. **Derive** from that profile: exact User-Agent string, `Sec-CH-UA` / `Sec-CH-UA-Mobile` / `Sec-CH-UA-Platform`, Accept-Language defaults, and preferred viewport/window sizes from a profile metadata table maintained in-repo.  
-4. L1 always calls `impersonate=<that profile id>`. L2 Playwright launches with the **same** derived UA and viewport.  
-5. Rotating personas means rotating **among supported profiles**, not inventing UAs outside the catalog.  
-6. When `curl_cffi` adds/removes profiles, update the metadata table; CI fails if the catalog references unknown profile IDs.
+**Further:** when L2 is enabled, even a coherent curl_cffi profile is wrong if it does not match Playwright’s **physical** Chromium major (§5.3.2). Playwright cannot spoof JA3/H2; L1 must claim what L2 actually is.
+
+1. At startup with L2 enabled: detect Playwright Chromium major; filter catalog to `chromium_major == that major`.  
+2. Enumerate remaining **supported** `curl_cffi` impersonation profile IDs (`ariadne doctor` / Session Sync).  
+3. Session Sync selects from the **anchored** set only (typically a single major; sticky per session).  
+4. **Derive** from that profile: exact User-Agent, `Sec-CH-UA` / `Sec-CH-UA-Mobile` / `Sec-CH-UA-Platform`, Accept-Language, viewport.  
+5. L1 always calls `impersonate=<that profile id>`. L2 Playwright contexts use the **same** derived UA and viewport.  
+6. Do not invent UAs outside the catalog. Do not rotate across Chromium majors while L2 is enabled.  
+7. When `curl_cffi` or Playwright adds/removes builds, update `profiles.yaml`; CI / `ariadne doctor` fails if no profile matches the installed Chromium major.  
 
 **Additional MUST:**
 
-7. Emit complete browser-like headers consistent with the derived persona: `Accept`, `Accept-Language`, `Accept-Encoding`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`.  
-8. Set realistic `Referer` (Google locale-matched, or same-site navigation referrer).  
-9. Support cookie jar persistence per sticky session via Session Sync.  
-10. L1 impersonation MUST apply the profile’s TLS **and** HTTP/2 fingerprint — not TLS alone.  
+8. Emit complete browser-like headers consistent with the derived persona: `Accept`, `Accept-Language`, `Accept-Encoding`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`.  
+9. Set realistic `Referer` (Google locale-matched, or same-site navigation referrer).  
+10. Support cookie jar persistence per sticky session via Session Sync.  
+11. L1 impersonation MUST apply the profile’s TLS **and** HTTP/2 fingerprint — not TLS alone.  
 
 **SHOULD:**
 
-11. Align locale/timezone with proxy geo when the sticky proxy encoding supports it.  
-12. Fail contract tests if observed JA3/H2 characteristics diverge from the selected profile’s expectations.
+12. Align locale/timezone with proxy geo when the sticky proxy encoding supports it.  
+13. Fail contract tests if observed JA3/H2 characteristics diverge from the selected profile’s expectations.  
+14. `ariadne doctor` prints Playwright major and the list of L1↔L2-compatible profiles.  
 
 ### 7.3 Proxy, DNS & OPSEC
 
@@ -472,17 +524,19 @@ You cannot pick a random User-Agent and ask `curl_cffi` to match it. Impersonati
 2. Wait strategies: `domcontentloaded`, `networkidle`, selector-based waits, `waitForResponse` for known APIs.  
 3. Infinite scroll / lazy-load helpers with randomized scroll depths and pauses.  
 4. Stealth patches for common automation fingerprints.  
-5. Prefer headed or `--headless=new` where stealth requires it; make mode configurable.  
-6. Resource blocking (images/fonts/CSS) as an **opt-in** speed mode — disabled by default on high-stealth targets (missing resources can alter fingerprints).  
-7. Persist and restore storage state through Session Sync (cookies + localStorage).  
-8. Capture screenshots **conditionally** (§6.5) — challenges, errors, auth transitions — not every page.  
-9. Apply DNS-via-proxy + WebRTC-disabled launch config on every browser/context (§7.3).  
+5. **Prefer headed mode** (`headless: false`) for stealth engagements. Cloudflare Turnstile and Akamai Bot Manager frequently flag `--headless=new` via font, WebGL, and boot-viewport discrepancies.  
+6. **Docker / headless servers:** when no physical display exists, run under **Xvfb** so Playwright remains headed. Container entrypoint MUST wrap the crawl: `xvfb-run -a ariadne crawl ...` (see §8 / `docker/`). Do not silently force `headless=true` in Docker without an explicit engagement override.  
+7. Resource blocking (images/fonts/CSS) as an **opt-in** speed mode — disabled by default on high-stealth targets (missing resources can alter fingerprints).  
+8. Persist and restore storage state through Session Sync (cookies + localStorage).  
+9. Capture screenshots **conditionally** (§6.5) — challenges, errors, auth transitions — not every page.  
+10. Apply DNS-via-proxy + WebRTC-disabled launch config on every browser/context (§7.3).  
+11. Honor **execution timeout** (§5.2.1) for the full L2 task after context acquire; never reuse the queue timeout for solve duration.  
 
 **SHOULD:**
 
-10. Simulate mouse movement trajectories and occasional mis-clicks / hesitation.  
-11. Warm up sessions (homepage → category → deep page) instead of cold deep-linking.  
-12. Multi-browser engine option post-MVP (Chromium primary; Firefox/WebKit for quirk bypass).  
+12. Simulate mouse movement trajectories and occasional mis-clicks / hesitation.  
+13. Warm up sessions (homepage → category → deep page) instead of cold deep-linking.  
+14. Multi-browser engine option post-MVP (Chromium primary; Firefox/WebKit for quirk bypass) — only if a matching curl_cffi profile and TLS story exist.  
 
 ### 7.6 Honeypot avoidance
 
@@ -514,12 +568,13 @@ Inline-style / obvious trap heuristics still apply on L1 before deferral.
 3. Pluggable solver interface (2Captcha / Anti-Captcha / CapSolver / unlocker API).  
 4. Escalate via **non-blocking re-schedule** (§5.5); never await L2 inside an L1 downloader slot.  
 5. Enforce **one in-flight solve per `session_id`** via Session Sync challenge mutex (§5.3.1).  
-6. After solve, write clearance into Session Sync, set `challenge_state=solved`, release lock, keep sticky proxy + profile-derived persona.  
+6. After solve, write clearance into Session Sync, set `challenge_state=solved`, release lock, keep sticky proxy + TLS-anchored persona.  
 7. Budget caps: max solves per run; alert when exceeded.  
-8. On de-escalate to L1, verify profile/TLS/H2 still match the solving session (§5.3).  
-9. Sibling requests waiting on clearance MUST NOT open additional L2 contexts for the same session.
+8. On de-escalate to L1, verify profile/TLS/H2 still match the solving session and Playwright Chromium major (§5.3 / §5.3.2).  
+9. Sibling requests waiting on clearance MUST NOT open additional L2 contexts for the same session.  
+10. Solver API polling MUST run inside an already-checked-out context bounded by **execution timeout** (≥ typical solver latency, e.g. 180s), not the **checkout queue timeout** (§5.2.1).  
 
-### 7.8 Security recon outputs
+### 7.8 Security recon outputs & apisnoop memory bounds
 
 Every successful (and relevant failed) response SHOULD contribute to:
 
@@ -536,6 +591,17 @@ Every successful (and relevant failed) response SHOULD contribute to:
 | Diff / canary | Hash of key selectors vs baseline |
 
 Heavy blobs (HAR, PNG) follow conditional capture rules (§6.5).
+
+#### 7.8.1 `apisnoop` OOM guard (`MAX_BODY_SIZE`)
+
+Playwright `page.on('response')` buffers bodies into the Python process. A SPA that serves a 20MB source map or 50MB JSON blob, across concurrent browsers and hundreds of pages, will OOM the Scrapy worker.
+
+**MUST:**
+
+1. Default `ARIADNE_MAX_BODY_SIZE` = **2 MiB** (configurable).  
+2. On each intercepted XHR/fetch/response: if `Content-Length` (or actual body length) exceeds the limit, record URL, method, status, content-type, and selected headers into `EndpointItem`, set `body_truncated=true`, and **drop** the body.  
+3. Never retain truncated payloads in HAR/export beyond the size cap.  
+4. Unit/integration tests prove oversized fixtures do not increase process RSS unboundedly (or at least that bodies are not attached to items).  
 
 ### 7.9 Prefer APIs over HTML when discovered
 
@@ -562,11 +628,13 @@ When network capture or static JS analysis reveals backend JSON endpoints that s
 | Performance | L0/L1: hundreds of concurrent requests (proxy-limited). L2: capped concurrent **checked-out** contexts from the pool. `CONCURRENT_REQUESTS` may exceed pool size; escalation must not couple them |
 | Event loop | No blocking calls on the asyncio reactor; Playwright work must be awaited; challenge waits must be re-schedules, not in-slot sleeps |
 | Reliability | Idempotent retries; resume from jobdir / queue snapshot; Session Sync durable for run lifetime; challenge lock leases expire |
+| Pool timeouts | Queue timeout ≠ execution timeout; execution ≥ typical CAPTCHA solver latency (§5.2.1) |
+| Memory | `apisnoop` enforces `MAX_BODY_SIZE` (default 2 MiB); no unbounded response-body buffering (§7.8.1) |
 | Disk I/O | Default NDJSON-only; HAR/screenshots conditional to avoid multi-GB exhaustion on large maps |
 | Security / OPSEC | No secrets in repo; PII redaction; TLS verify on; DNS/WebRTC leak protections |
-| Portability | Linux primary; Docker image with Playwright deps |
-| Observability | Structured logs, optional Prometheus (success rate, challenge rate, latency, pool wait time, proxy health) |
-| Testability | pytest unit tests; local fixtures; leak-check; H2/TLS profile contract tests |
+| Portability | Linux primary; Docker image with Playwright deps, fonts, and **Xvfb**; entrypoint `xvfb-run` for headed stealth (§7.5) |
+| Observability | Structured logs, optional Prometheus (success/challenge/latency, pool wait, body truncations, browser recycles) |
+| Testability | pytest; fixtures; leak-check; Chromium-anchor filter tests; H2/TLS contract tests |
 
 ---
 
@@ -600,9 +668,10 @@ crawl:
   transport:
     initial_mode: L1_impersonate
     escalate_to: [L2_browser, L3_unlocker]
-    # Optional allowlist; if omitted, Session Sync picks from full supported catalog.
-    # Personas are ALWAYS derived from these profiles — never invent UAs outside the catalog.
-    impersonate_profiles: [chrome124, chrome131, firefox133]
+    # When L2 is enabled, Session Sync IGNORES this list unless entries match
+    # Playwright's Chromium major (TLS anchor). Prefer omitting and letting
+    # the catalog auto-select the anchored profile.
+    impersonate_profiles: null
   concurrency:
     max_concurrent_requests: 8
     download_delay_mean: 3.5
@@ -612,15 +681,17 @@ crawl:
     clearance_wait_delay_mean: 2.0
     escalation_priority: 100       # mandatory high priority for L2 + clearance waiters
   browser:
-    headless: false
+    headless: false                # prefer headed; use Xvfb in Docker
     stealth: true
     humanize: true
-    capture_network: true      # apisnoop / conditional HAR
-    pool_size: 4               # max concurrent BrowserContexts
-    checkout_timeout_seconds: 60
-    max_contexts_served: 5000  # recycle root Chromium process after this many contexts
-    disable_webrtc: true       # mandatory default
-    proxy_dns: true            # mandatory when proxy set
+    capture_network: true          # apisnoop / conditional HAR
+    pool_size: 4                   # max concurrent BrowserContexts
+    checkout_timeout_seconds: 60   # QUEUE wait to acquire a context
+    execution_timeout_seconds: 180 # HOLD time after acquire (CAPTCHA solves)
+    max_contexts_served: 5000      # recycle root Chromium process after this many contexts
+    disable_webrtc: true           # mandatory default
+    proxy_dns: true                # mandatory when proxy set
+    max_body_size_bytes: 2097152   # 2 MiB apisnoop OOM guard
   honeypot:
     l1_unverified: defer       # defer | risk_score | follow
   proxies:
@@ -654,9 +725,9 @@ Proxy credentials via env, e.g. `ARIADNE_PROXY_URL` or `ARIADNE_PROXY_LIST_FILE`
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 ```
 
-Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES_ENABLED` (jar ultimately owned by Session Sync), `RETRY_HTTP_CODES`, middleware order, Playwright launch options, `DUPEFILTER_CLASS = "ariadne.dupefilters.TransportAwareDupeFilter"`, browser pool size / checkout timeout, challenge lease TTL.
+Also expose: `CONCURRENT_REQUESTS`, `DOWNLOAD_DELAY`, `AUTOTHROTTLE_*`, `COOKIES_ENABLED` (jar ultimately owned by Session Sync), `RETRY_HTTP_CODES`, middleware order, Playwright launch options, `DUPEFILTER_CLASS = "ariadne.dupefilters.TransportAwareDupeFilter"`, `ARIADNE_BROWSER_POOL_SIZE`, `ARIADNE_BROWSER_CHECKOUT_TIMEOUT`, `ARIADNE_BROWSER_EXECUTION_TIMEOUT`, `ARIADNE_MAX_BODY_SIZE`, `ARIADNE_BROWSER_HEADLESS`, challenge lease TTL.
 
-> Note: Raising `CONCURRENT_REQUESTS` above Browser Pool size is expected and safe **because** escalation re-schedules instead of awaiting checkout in-slot. Pool size caps only true L2 parallelism, not total crawl concurrency.
+> Note: Raising `CONCURRENT_REQUESTS` above Browser Pool size is expected and safe **because** escalation re-schedules instead of awaiting checkout in-slot. Pool size caps only true L2 parallelism, not total crawl concurrency. CAPTCHA solves consume a pool slot for up to `execution_timeout`, so size the pool for concurrent domains under challenge — not for solver latency alone.
 
 ---
 
@@ -723,10 +794,10 @@ L2 request (later) → PlaywrightPoolDownloadHandler
 
 1. Engagement banner (logs authorization metadata at start)  
 2. **AsyncioReactorGuard** — abort if wrong reactor  
-3. **BrowserPoolExtension** — start/stop pool; **MUST** close all Playwright browsers on `engine_stopped` and on SIGINT/SIGTERM before reactor teardown (no zombie Chromium); recycle root browser after MaxContextsServed  
-4. **SessionSyncExtension** — process-lifetime session store; expose `burn_proxy(session_id)` for sticky-IP death → drop clearance → rotate proxy → re-escalate  
+3. **BrowserPoolExtension** — start/stop pool; **MUST** close all Playwright browsers on `engine_stopped` and on SIGINT/SIGTERM before reactor teardown (no zombie Chromium); recycle root browser after MaxContextsServed; expose separate checkout vs execution timeouts  
+4. **SessionSyncExtension** — process-lifetime session store; detect Playwright Chromium major and filter profiles (TLS anchor); expose `burn_proxy(session_id)` for sticky-IP death → drop clearance → rotate proxy → re-escalate  
 5. Kill-switch watcher  
-6. Metrics exporter (include pool wait time, escalation counts, challenge-lock waiters, re-schedule rate, browser process recycles)  
+6. Metrics exporter (include pool wait time, escalation counts, challenge-lock waiters, re-schedule rate, browser process recycles, body truncations)  
 7. Canary scheduler  
 
 ### 10.6 DupeFilter
@@ -740,9 +811,10 @@ Escalation paths MUST still set `dont_filter=True` as belt-and-suspenders during
 ### 10.7 Session Synchronization Service (API sketch)
 
 ```text
-# Persona factory (profile → headers), never UA → profile
-list_impersonate_profiles() -> list[ProfileMeta]
+# Persona factory (profile → headers); when L2 on, filter by Playwright chromium_major
+list_impersonate_profiles(allowlist=None, chromium_major=None, require_l2_anchor=False) -> list[ProfileMeta]
 create_persona_from_profile(profile_id) -> Persona
+detect_playwright_chromium_major() -> int | None
 
 get_or_create(session_id | host) -> Session
 bind_persona(session, persona)          # persona must reference a known profile_id
@@ -765,7 +837,17 @@ burn_sticky_proxy(session_id, reason) -> Session
 
 ### 10.8 Profile metadata catalog
 
-Ship `ariadne/stealth/profiles.yaml` (or similar) mapping each supported `curl_cffi` profile id → canonical UA, Client Hints, default viewport. Session Sync refuses personas that are not in this catalog.
+Ship `ariadne/stealth/profiles.yaml` mapping each supported `curl_cffi` profile id → canonical UA, Client Hints, default viewport, **`chromium_major`**, and **`l2_compatible`**. Session Sync refuses personas that are not in this catalog. When L2 is enabled, only profiles with matching `chromium_major` and `l2_compatible: true` are selectable (§5.3.2).
+
+### 10.9 Docker / Xvfb
+
+| Artifact | Requirement |
+| --- | --- |
+| `docker/Dockerfile` | Playwright base image + `xvfb` + liberation/noto fonts |
+| `docker/entrypoint.sh` | `xvfb-run -a --server-args="-screen 0 1920x1080x24" "$@"` when `ARIADNE_USE_XVFB=1` (default) |
+| Default browser mode in image | `ARIADNE_BROWSER_HEADLESS=false` |
+
+Operators may set `ARIADNE_USE_XVFB=0` and `headless: true` only when ROE accepts reduced stealth.
 ---
 
 ## 11. Data model (core items)
@@ -808,8 +890,8 @@ ariadne canary -c engagement.yaml
 ariadne resume JOBDIR
 ariadne report ./artifacts/ACME-2026-Q3-WEB
 ariadne pack ./artifacts/ACME-2026-Q3-WEB --encrypt   # GPG evidence bundle
-ariadne doctor              # reactor, browsers, proxies
-ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
+ariadne doctor              # reactor, browsers, TLS anchor, proxies
+ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 ```
 
 `report` produces a Markdown summary: scope adherence, pages fetched, challenge rates, robots hints followed, top endpoints, tech stack, recommended follow-on tests (informational only — no exploit content).
@@ -825,12 +907,16 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 | Concurrency | Challenge storm: N>L2-pool L1 challenges must not stall unrelated L0/L1 requests; assert downloader slot frees on escalate |
 | Thundering herd | N concurrent challenges for one `session_id` → exactly one L2 solve; others wait/re-schedule |
 | DupeFilter | L2 escalate of a previously seen L1 URL is not dropped |
-| Contract | Catalog profile IDs ⊆ curl_cffi supported set; derived UA matches profile metadata |
+| Contract | Catalog profile IDs ⊆ curl_cffi supported set; derived UA matches profile metadata; `chromium_major` present for L2 profiles |
+| TLS anchor | With mocked Playwright major M, Session Sync only emits profiles where `chromium_major == M`; missing match fails closed |
+| Pool timeouts | Unit tests assert `checkout_timeout` ≠ `execution_timeout` and CAPTCHA-length tasks are not killed by queue TTL |
+| apisnoop OOM | Oversized fixture responses yield `body_truncated=true` EndpointItems without attaching full bodies |
 | Reactor | Boot fails/tests fail if AsyncioSelectorReactor not installed |
-| Pool | Checkout timeout re-schedules (no unbounded wait); no cross-session cookie bleed |
-| OPSEC | Leak-check: with proxy set, WebRTC/DNS must not expose host IP |
+| Pool | Checkout timeout re-schedules (no unbounded wait); no cross-session cookie bleed; engine_stopped closes browsers |
+| OPSEC | Leak-check: with proxy set, WebRTC/DNS must not expose host IP; launch args include `--disable-webrtc` |
 | Stealth canary | Optional gated tests against public bot-detection demos; never against third-party production without auth |
 | I/O | Assert HAR/screenshots absent on normal `map` crawl; present on challenge fixture |
+| Docker | Image build installs Xvfb; entrypoint documentation requires `xvfb-run` for headed mode |
 
 ---
 
@@ -844,13 +930,18 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 
 - Scope enforcement, Session Sync (in-process) with profile→persona factory + challenge mutex stubs, TransportAwareDupeFilter, persona headers, curl_cffi TLS+H2 handler, generic proxy middleware (DNS-safe), backoff, robots `observe` + hints, map/extract spiders, NDJSON export, L1 honeypot deferral stubs, **non-blocking escalate re-schedule skeleton** (even before real L2)  
 
-### Phase 2 — L2 Playwright pool + recon
+### Phase 2 — L2 Playwright pool + recon ✅
 
-- Browser Pool + checkout manager, WebRTC disabled + proxy DNS, humanization, network capture (`apisnoop`), Session Sync L1↔L2 handoff with mutex, challenge-storm concurrency tests, honeypot visibility validation queue, conditional screenshots, defense event taxonomy  
+- Browser Pool + checkout manager with **split queue/execution timeouts**
+- Playwright Chromium **TLS anchor** gating Session Sync profiles
+- WebRTC disabled + proxy DNS; humanization; headed default + **Xvfb Docker**
+- Network capture (`apisnoop`) with **`MAX_BODY_SIZE`** truncation
+- Session Sync L1↔L2 handoff with mutex; challenge-storm concurrency tests
+- Honeypot visibility validation queue; conditional screenshots; defense event taxonomy
 
 ### Phase 3 — Hardening & scale
 
-- CAPTCHA solver plugins, L3 unlocker adapter, metrics (pool wait, escalations), `ariadne pack --encrypt`, canary/drift system, Docker  
+- CAPTCHA solver plugins (respecting execution timeout), L3 unlocker adapter, metrics, `ariadne pack --encrypt`, canary/drift system, production hardening of Docker/Xvfb
 
 ### Phase 4 — Advanced (optional)
 
@@ -862,22 +953,25 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 
 1. Given a valid engagement YAML, Ariadne refuses to crawl out-of-scope hosts.  
 2. Process runs on `AsyncioSelectorReactor`; `ariadne doctor` detects misconfiguration.  
-3. Every session persona is derived from a supported `curl_cffi` profile; inventing a UA outside the catalog is impossible via public APIs.  
-4. L1 requests present browser-consistent TLS **and** HTTP/2 fingerprints for that profile (contract tests).  
+3. With L2 enabled, every session persona matches Playwright’s Chromium major; inventing a UA / selecting a mismatched major is impossible via public APIs.  
+4. L1 requests present browser-consistent TLS **and** HTTP/2 fingerprints for that anchored profile (contract tests).  
 5. On JS-rendered fixture SPA, L2 extracts items that L0/L1 cannot.  
-6. L1→L2 challenge solve → L1 reuse succeeds on fixture **only when** Session Sync keeps profile+cookies coherent; mismatched persona test fails closed.  
+6. L1→L2 challenge solve → L1 reuse succeeds on fixture **only when** Session Sync keeps profile+cookies+major coherent; mismatched major/persona test fails closed.  
 7. Browser Pool reuses contexts; per-request browser launch is not the default path.  
 8. **Concurrency:** with `CONCURRENT_REQUESTS=16` and `pool_size=4`, a synthetic challenge storm on many URLs does not prevent unrelated non-challenge L1 requests from completing (escalation frees slots via re-schedule).  
 9. **Thundering herd:** N concurrent challenges for one `session_id` result in exactly one L2 solve attempt; siblings wait on clearance.  
 10. **DupeFilter:** re-scheduled L2 request for a URL already fetched at L1 is not silently dropped.  
-11. Honeypot fixture with **external CSS** is not followed from L1 without L2 validation (defer policy).  
-12. With proxy configured, leak-check passes (no host IP via WebRTC/DNS).  
-13. 429 responses respect `Retry-After` and jittered exponential backoff.  
-14. `apisnoop` emits EndpointItems from XHR; HAR exists for that mode; normal `map` does not write per-page HAR/PNG.  
-15. `respect_robots: observe` records `RobotsHintItem`s and still crawls Disallow paths in scope.  
-16. Kill-switch stops scheduling new requests within 5 seconds.  
-17. `ariadne pack --encrypt` produces a client-deliverable archive.  
-18. Unit + integration tests pass in CI without live target dependence.
+11. **Split timeouts:** a simulated 90s CAPTCHA hold does not fail solely because `checkout_timeout=60`; execution timeout governs the hold.  
+12. **apisnoop OOM:** a >`MAX_BODY_SIZE` XHR fixture yields an EndpointItem with `body_truncated=true` and no full body attached.  
+13. **Headed/Xvfb:** Docker entrypoint documents/uses `xvfb-run`; default `headless=false` for stealth.  
+14. Honeypot fixture with **external CSS** is not followed from L1 without L2 validation (defer policy).  
+15. With proxy configured, leak-check passes (no host IP via WebRTC/DNS).  
+16. 429 responses respect `Retry-After` and jittered exponential backoff.  
+17. `apisnoop` emits EndpointItems from XHR; HAR exists for that mode when configured; normal `map` does not write per-page HAR/PNG.  
+18. `respect_robots: observe` records `RobotsHintItem`s and still crawls Disallow paths in scope.  
+19. Kill-switch stops scheduling new requests within 5 seconds; BrowserPool closes on engine stop (no zombie Chromium in tests).  
+20. `ariadne pack --encrypt` produces a client-deliverable archive (Phase 3 may complete encryption; Phase 2 at least documents the command).  
+21. Unit + integration tests pass in CI without live target dependence.  
 
 ---
 
@@ -890,6 +984,10 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary with proxy configured
 | Challenge thundering herd | Wasted solves, IP challenge loops, cookie races | Per-session challenge mutex (§5.3.1) |
 | RFPDupeFilter drops L2 retry | Silent “success” with no bypass | TransportAwareDupeFilter + `dont_filter` on escalate (§5.6) |
 | UA/profile mismatch | Instant Akamai/CF block | Profile-sourced personas only (§7.2) |
+| L1↔L2 Chromium major drift | Clearance invalidated on handoff | Playwright major is TLS anchor (§5.3.2); fail closed if no catalog match |
+| CAPTCHA solve vs checkout TTL | Mid-solve kills; re-schedule storms | Split queue vs execution timeouts (§5.2.1) |
+| apisnoop large bodies | Worker OOM | `MAX_BODY_SIZE` truncation (§7.8.1) |
+| Headless flags in Docker | Stealth failure / crash | Headed + Xvfb entrypoint (§7.5 / §10.9) |
 | L1↔L2 clearance invalidation | Challenge storms, wasted residential bandwidth | Session Sync coherence asserts before de-escalation |
 | DNS/WebRTC leak | OPSEC failure, ROE incident | Proxy DNS + WebRTC disabled; leak-check in doctor |
 | HTTP/2 fingerprint drift | Silent Akamai/CF blocks despite good TLS | curl_cffi profile contract tests; catalog binding |
@@ -933,7 +1031,7 @@ Ariadne/
 │   ├── session/            # Session Synchronization Service + challenge mutex
 │   ├── browser/            # Browser Pool + checkout manager
 │   ├── dupefilters/        # TransportAwareDupeFilter
-│   ├── stealth/            # profiles.yaml catalog (profile → UA/CH/viewport)
+│   ├── stealth/            # profiles.yaml + chromium.py TLS anchor
 │   ├── spidermiddlewares/
 │   ├── downloadermiddlewares/
 │   ├── downloadhandlers/   # curl_cffi (TLS+H2), playwright pool
@@ -945,7 +1043,7 @@ Ariadne/
 │   └── reporting/
 ├── engagements/            # example configs (no secrets)
 ├── tests/
-└── docker/
+└── docker/                 # Dockerfile + xvfb-run entrypoint (headed stealth)
 ```
 
 ---
@@ -968,6 +1066,10 @@ v1.1 additionally incorporated internal red-team review on Twisted/asyncio imped
 
 v1.2 incorporates Scrapy execution review: non-blocking escalation (downloader slot starvation), per-session challenge mutex (thundering herd), transport-aware DupeFilter, and profile-sourced persona generation.
 
+v1.2.1 adds mandatory escalation priority, proxy-burn lifecycle, Playwright zombie teardown, and root Chromium process recycle.
+
+v1.3.0 elevates Phase 2 physical realities to normative requirements: Playwright Chromium as L1↔L2 **TLS anchor**, **split queue/execution timeouts** for CAPTCHA pool safety, **`MAX_BODY_SIZE`** for apisnoop OOM prevention, and **headed+Xvfb** Docker stealth.
+
 ---
 
 ## 20. Decisions (resolved)
@@ -982,30 +1084,34 @@ v1.2 incorporates Scrapy execution review: non-blocking escalation (downloader s
 | 6 | Escalate by awaiting L2 in middleware? | **No.** Always re-schedule; free the downloader slot (§5.5). |
 | 7 | Concurrent solves per session? | **Exactly one** via challenge mutex (§5.3.1). |
 | 8 | How to avoid DupeFilter dropping L2? | **TransportAwareDupeFilter** + `dont_filter=True` on escalate (§5.6). |
-| 9 | UA vs curl_cffi profile precedence? | **Profile is source of truth;** derive UA/Client Hints from catalog (§7.2). |
+| 9 | UA vs curl_cffi profile precedence? | **Profile is source of truth** for headers; when L2 on, **Playwright Chromium major** selects which profile (§5.3.2 / §7.2). |
 | 10 | Escalation request priority? | **Mandatory high priority** (default 100) so L2 solves beat deep L1 queues within lease TTL. |
 | 11 | Sticky proxy burned / IP change? | Drop clearance, rotate proxy, keep persona, full L2 re-escalate — never reuse IP-bound cookies. |
 | 12 | Playwright on SIGTERM? | Close all browsers on `engine_stopped` / signal handlers before reactor shutdown. |
 | 13 | Chromium process leaks? | Recycle root browser after MaxContextsServed; drain then kill. |
+| 14 | L1↔L2 TLS fingerprint anchor? | **Playwright bundled Chromium major** is immutable; curl_cffi must match — never rotate majors under L2. |
+| 15 | CAPTCHA vs pool checkout timeout? | **Split timeouts:** queue (acquire) vs execution (solve hold). Default 60s / 180s. |
+| 16 | apisnoop large response bodies? | Enforce **`MAX_BODY_SIZE` (2 MiB default)**; truncate bodies, keep EndpointItem metadata. |
+| 17 | Headed Playwright in Docker? | **Xvfb** via `xvfb-run` entrypoint; default `headless=false`. |
 
 ### 20.1 Remaining open (non-blocking)
 
 1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP) — mutex semantics must be distributed if so.  
 2. Whether clearance-wait siblings should use a dedicated low-cost “probe” request or full L1 GET after solve.  
-3. Cadence for refreshing `profiles.yaml` when `curl_cffi` releases new impersonation builds.  
+3. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
+4. Exact CAPTCHA vendor adapters and per-vendor execution-timeout defaults (Phase 3).  
 
-v1.2.1 adds: mandatory escalation priority vs lease TTL, proxy-burn session lifecycle, Playwright zombie teardown, and root Chromium process recycle.
+v1.2.1 added: mandatory escalation priority vs lease TTL, proxy-burn session lifecycle, Playwright zombie teardown, and root Chromium process recycle.
+
+v1.3.0 adds the four Phase 2 physical traps as normative requirements: **Playwright TLS anchor**, **split queue/execution timeouts**, **`MAX_BODY_SIZE` apisnoop guard**, and **headed+Xvfb Docker stealth**.
 
 ---
 
 ## 21. Next implementation step
 
-Implement **Phase 1** against this v1.2.1 spec:
+Phase 1–2 are implemented in-tree. Proceed to **Phase 3**:
 
-1. Scaffold Scrapy project with **mandatory `AsyncioSelectorReactor`** and `TransportAwareDupeFilter`.  
-2. Engagement schema validation (`respect_robots: observe` default).  
-3. In-process Session Sync: profile catalog → persona factory, challenge mutex API, Scope / Persona / Proxy middlewares.  
-4. curl_cffi L1 handler bound to `persona.impersonate_id` (TLS **and** HTTP/2).  
-5. ChallengeDetect **re-schedule** skeleton (even if L2 is a stub handler initially).  
-6. Backoff, robots observe + `RobotsHintItem`, Map/Extract spiders, NDJSON artifacts.  
-7. Tests: reactor guard, profile→persona, dupefilter escalate, mutex unit tests, local fixtures.
+1. CAPTCHA solver plugins that respect `ARIADNE_BROWSER_EXECUTION_TIMEOUT`.  
+2. L3 unlocker adapter.  
+3. Metrics (pool wait, escalations, truncations) and `ariadne pack --encrypt`.  
+4. Canary/drift system and production Docker hardening.  
