@@ -1,8 +1,8 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.3.0  
-**Status:** Phase 1–2 implemented; ready for Phase 3 (CAPTCHA solvers / unlockers / scale)  
+**Version:** 1.4.0  
+**Status:** Phase 1–3 implemented (solvers, unlockers, circuit breaker, evidence pack)  
 **Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
@@ -47,10 +47,14 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 9. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
 10. **Bounded network capture** — `apisnoop` MUST enforce `MAX_BODY_SIZE`; oversize XHR/fetch bodies are dropped after recording URL/method/headers.
 11. **Headed stealth in containers** — prefer full headed Chromium; Docker MUST provide Xvfb (`xvfb-run`) so headed mode works without a physical display.
-12. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
-13. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
-14. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
-15. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
+12. **No L3 Franken-sessions** — clearance from a commercial unlocker is bound to the vendor’s IP/UA/JA3. Sessions that reach L3 are `locked_to_mode=L3` and MUST NOT de-escalate to L1/L2 with those cookies.
+13. **CAPTCHA injection strategies** — solver plugins return tokens *and* target-specific submit strategies (form / JS callback / click); generic textarea injection is insufficient.
+14. **Circuit breaker on drift** — sustained empty extractions trip the breaker, drain the queue, and exit critically (no alert spam / bandwidth burn).
+15. **Script-friendly evidence encryption** — `ariadne pack --encrypt` uses an explicit recipient public key file (`--pubkey`) and prefers `age` over host GPG keyrings.
+16. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
+17. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
+18. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
+19. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
 
 ---
 
@@ -122,6 +126,10 @@ Use `obey` only when the ROE or client explicitly requires crawl-delay / disallo
 | G14 | CAPTCHA solves do not starve the pool | Queue timeout ≠ execution timeout; long solver polls do not kill mid-solve via checkout TTL |
 | G15 | apisnoop memory safety | Bodies over `MAX_BODY_SIZE` never buffered into the Scrapy worker |
 | G16 | Headed stealth in Docker | Container entrypoint uses Xvfb; Playwright `headless=false` by default for stealth engagements |
+| G17 | No L3 Franken-sessions | Sessions locked to L3 after unlocker solve; no cookie reuse on L1/L2 |
+| G18 | CAPTCHA token actually submits | Injection strategy plugins succeed on fixture Turnstile/reCAPTCHA flows |
+| G19 | Drift stops the crawl | Circuit breaker trips on sustained empty extractions; engine drains and exits critical |
+| G20 | Encrypt without GPG keyring hell | `pack --encrypt --pubkey file.asc` (or age recipient) works in Docker/CI without `~/.gnupg` |
 
 ### 3.2 Non-goals
 
@@ -269,6 +277,7 @@ Progressive escalation fails in practice when L1 and L2 do not share state. A de
 | `tls_profile` / `h2_profile` | Impersonation id — **identical** to the persona’s source `curl_cffi` profile and Playwright Chromium major |
 | `challenge_state` | `idle` \| `solving` \| `solved` \| `failed` — gates concurrent escalations |
 | `challenge_lock` | Per-`session_id` async mutex / exclusive lease for WAF solves |
+| `locked_to_mode` | `None` \| `L3_unlocker` (extensible) — when set, all subsequent fetches for this session MUST use that transport; de-escalation forbidden |
 
 **Handoff rules (MUST):**
 
@@ -279,6 +288,7 @@ Progressive escalation fails in practice when L1 and L2 do not share state. A de
 5. Subsequent L1 requests for that `session_id` load the synced jar and **identical** profile-derived UA / Client Hints / TLS+H2 impersonation.  
 6. If persona and clearance fingerprints diverge, invalidate clearance and re-escalate (do not silently send mismatched L1 traffic).  
 7. **Proxy burn / IP bind:** Clearance cookies (`cf_clearance`, `_abck`, etc.) are bound to the client IP. If the sticky proxy is burned (repeated TCP timeouts, instant 403s without a JS challenge body, provider soft-ban), Session Sync MUST: drop clearance cookies + storage state → rotate sticky proxy endpoint → **keep the same persona/profile** → set `challenge_state=idle` → force full L2 re-escalate on the next request for that `session_id`. Never reuse clearance on a new IP.  
+8. **L3 lock:** If a request is fulfilled by an L3 unlocker, set `locked_to_mode=L3_unlocker` and do **not** merge vendor clearance cookies into a jar intended for L1/L2 reuse (§5.4.1).  
 
 Without this service, `cf_clearance` acquired in Playwright is invalidated the moment `curl_cffi` resumes with a different JA3/UA.
 
@@ -337,7 +347,24 @@ Requests flow through escalating transport modes:
 
 Escalation triggers (configurable): HTTP 403/429/503 with challenge body signatures, Cloudflare interstitial HTML, empty SPA shells, CAPTCHA iframes, DataDome deny pages, soft-block patterns (delayed empty responses).
 
-De-escalation (L2 → L1) is allowed **only** after Session Sync confirms clearance + persona coherence.
+De-escalation (L2 → L1) is allowed **only** after Session Sync confirms clearance + persona coherence **and** `locked_to_mode` is unset.
+
+#### 5.4.1 L3 unlocker Franken-session trap
+
+Commercial unlockers (Bright Data Web Unlocker, ScraperAPI, etc.) negotiate TLS and solve WAFs on **vendor infrastructure**. Returned HTML may include clearance cookies bound to the **vendor’s** IP, UA, and JA3 — not Ariadne’s residential sticky session or curl_cffi/Playwright anchor.
+
+**MUST NOT:**
+
+1. Write L3-acquired clearance cookies into the Session Sync jar and then de-escalate to L1 or L2.  
+2. Assume `cf_clearance` from an unlocker response is portable to Ariadne transports.
+
+**MUST:**
+
+1. On first successful L3 fetch for a `session_id`, set `session.locked_to_mode = "L3_unlocker"`.  
+2. All subsequent requests for that session force `transport_mode=L3_unlocker` (SessionSyncMiddleware / ChallengeDetect honor the lock).  
+3. To leave L3: **burn** the session (drop cookies/storage, clear `locked_to_mode`) and create a fresh `session_id` / sticky proxy — never transplant unlocker cookies onto L1/L2.  
+4. Store unlocker-only cookie jars separately if needed for L3 sticky vendor sessions; never mix with L1/L2 jars.  
+5. Log a `DefenseEvent` of type `l3_lock` when the lock engages.
 
 ### 5.5 Non-blocking escalation (concurrency starvation fix)
 
@@ -441,13 +468,31 @@ Default artifacts are **lightweight**:
 3. An error or state transition occurs (auth success/fail, clearance obtained/lost), or  
 4. Operator sets `output.capture: always` (discouraged; warn on large scopes).  
 
-Ephemeral local storage is the default. Client delivery uses:
+### 6.5 Storage & export (I/O-aware)
+
+Default artifacts are **lightweight**:
+
+- NDJSON page/endpoint/form/defense streams  
+- Optional SQLite index  
+- Markdown summary via `ariadne report`  
+
+**Conditional / expensive artifacts** (HAR, full-page screenshots, storage-state dumps) are captured **only** when:
+
+1. A challenge / block / CAPTCHA page is detected (debug + evidence), or  
+2. Mode is explicitly `apisnoop` (network HAR for API inventory), or  
+3. An error or state transition occurs (auth success/fail, clearance obtained/lost), or  
+4. Operator sets `output.capture: always` (discouraged; warn on large scopes).  
+
+Ephemeral local storage is the default. Client delivery:
 
 ```bash
-ariadne pack ./artifacts/ENGAGEMENT --encrypt   # GPG-encrypt bundle for handoff
+# Prefer age (script-friendly). Explicit pubkey file — NO host GPG keyring / pinentry.
+ariadne pack ./artifacts/ENGAGEMENT --encrypt --pubkey recipient.age
+# Or ASCII-armored recipient key for age/GPG-compatible workflows:
+ariadne pack ./artifacts/ENGAGEMENT --encrypt --pubkey recipient.asc
 ```
 
-No built-in cloud retention policy in MVP.
+**MUST NOT** require `~/.gnupg`, interactive `pinentry`, or ambient default-key selection inside Docker/CI. Cryptography UX is file-in / file-out. Preferred implementation: **`age`** via `pyrage` (or CLI `age`); optional GPG only when `--pubkey` points at a public key file and `--batch`/`--trust-model always` avoids prompts.
 
 ---
 
@@ -574,6 +619,20 @@ Inline-style / obvious trap heuristics still apply on L1 before deferral.
 9. Sibling requests waiting on clearance MUST NOT open additional L2 contexts for the same session.  
 10. Solver API polling MUST run inside an already-checked-out context bounded by **execution timeout** (≥ typical solver latency, e.g. 180s), not the **checkout queue timeout** (§5.2.1).  
 
+#### 7.7.1 Token injection strategies (not just token fetch)
+
+Retrieving a solve token from 2Captcha/CapSolver is ~20% of the work. Modern Turnstile / reCAPTCHA often will not accept a naive form POST. They require injecting the token into a hidden field and invoking a **dynamically named, minified** JS callback (e.g. paths under `___grecaptcha_cfg.clients[...]`) or clicking a specific element.
+
+**MUST** define a pluggable `InjectionStrategy` on the solver plugin interface:
+
+| Strategy | Method | When |
+| --- | --- | --- |
+| Form submit | `inject_and_submit_form(page, token, field_selector, form_selector)` | Classic hidden-input + form submit |
+| JS callback | `inject_and_trigger_callback(page, token, callback_name \| callback_resolver)` | reCAPTCHA/Turnstile client callbacks |
+| Click | `inject_and_click_element(page, token, field_selector, click_selector)` | Custom UI that unlocks on button click after token set |
+
+**MUST NOT** assume a single generic DOM injection works across targets. Target-specific strategy configs (YAML/engagement) select which method runs after the token API returns. Strategies run inside L2 under the execution timeout.
+
 ### 7.8 Security recon outputs & apisnoop memory bounds
 
 Every successful (and relevant failed) response SHOULD contribute to:
@@ -611,13 +670,34 @@ When network capture or static JS analysis reveals backend JSON endpoints that s
 2. Optionally switch spider to API mode for efficiency (lower bot scrutiny, structured data).  
 3. Document auth headers/tokens required; store tokens only in Session Sync / secret-backed store.  
 
-### 7.10 Site change detection
+### 7.10 Site change detection & circuit breaker
 
 **MUST:**
 
 1. Support canary URLs with expected selectors / min item counts.  
-2. Fail health check (and alert) when extraction success rate drops below threshold.  
+2. Fail health check when extraction success rate drops below threshold.  
 3. Unit-testable spider fixtures per page type (list, detail, search, login).  
+
+#### 7.10.1 Circuit breaker (alert fatigue / bandwidth burn)
+
+A UI/XPath drift can yield thousands of HTTP 200 pages with **empty** extractions. Logging every failure spams operators and burns engagement proxy budget.
+
+**MUST** implement `CircuitBreakerMiddleware` (or extension):
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `window` | 50 | Consecutive L0/L1 (or all-mode) responses evaluated |
+| `empty_ratio_threshold` | 0.50 | Trip when ≥50% of window have empty/failed extraction |
+| `min_samples` | 20 | Do not trip before enough samples |
+
+**On trip:**
+
+1. Emit a single critical `DefenseEvent` / log (`circuit_breaker_trip`).  
+2. Pause scheduling new requests; gracefully **drain** in-flight work.  
+3. Close the spider / engine with reason `extraction_drift` (non-zero exit).  
+4. Do **not** continue crawling or spam per-page alerts after the trip.
+
+Canary mode (§7.1) remains for proactive light checks; the circuit breaker protects full crawls from silent hollow success.
 
 ---
 
@@ -889,7 +969,7 @@ ariadne crawl -c engagement.yaml
 ariadne canary -c engagement.yaml
 ariadne resume JOBDIR
 ariadne report ./artifacts/ACME-2026-Q3-WEB
-ariadne pack ./artifacts/ACME-2026-Q3-WEB --encrypt   # GPG evidence bundle
+ariadne pack ./artifacts/ACME-2026-Q3-WEB --encrypt --pubkey recipient.age
 ariadne doctor              # reactor, browsers, TLS anchor, proxies
 ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 ```
@@ -939,9 +1019,13 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 - Session Sync L1↔L2 handoff with mutex; challenge-storm concurrency tests
 - Honeypot visibility validation queue; conditional screenshots; defense event taxonomy
 
-### Phase 3 — Hardening & scale
+### Phase 3 — Hardening & scale ✅
 
-- CAPTCHA solver plugins (respecting execution timeout), L3 unlocker adapter, metrics, `ariadne pack --encrypt`, canary/drift system, production hardening of Docker/Xvfb
+- CAPTCHA solver plugins with **InjectionStrategy** (form / callback / click), respecting execution timeout  
+- L3 unlocker adapter with **`locked_to_mode`** (no Franken-sessions)  
+- **CircuitBreakerMiddleware** on extraction drift  
+- `ariadne pack --encrypt --pubkey` (age-preferred; no GPG keyring)  
+- Metrics hooks; Docker/Xvfb already from Phase 2  
 
 ### Phase 4 — Advanced (optional)
 
@@ -1070,6 +1154,8 @@ v1.2.1 adds mandatory escalation priority, proxy-burn lifecycle, Playwright zomb
 
 v1.3.0 elevates Phase 2 physical realities to normative requirements: Playwright Chromium as L1↔L2 **TLS anchor**, **split queue/execution timeouts** for CAPTCHA pool safety, **`MAX_BODY_SIZE`** for apisnoop OOM prevention, and **headed+Xvfb** Docker stealth.
 
+v1.4.0 adds Phase 3 traps: L3 **`locked_to_mode`** (no Franken-sessions), CAPTCHA **injection strategies**, **circuit breaker** on extraction drift, and **pubkey-file / age** pack encryption.
+
 ---
 
 ## 20. Decisions (resolved)
@@ -1078,7 +1164,7 @@ v1.3.0 elevates Phase 2 physical realities to normative requirements: Playwright
 | --- | --- | --- |
 | 1 | Proxy vendor adapters vs generic? | **Generic HTTP(S) proxy URLs only for MVP.** Operators encode provider geo/session in userinfo. No Bright Data/Oxylabs first-party SDKs until a clear need. |
 | 2 | SeleniumBase UC in MVP? | **Playwright-only** through Phase 2. Dual automation stacks deferred to Phase 4 if required. |
-| 3 | Evidence retention / encryption? | **Local ephemeral artifacts** by default. `ariadne pack --encrypt` (GPG) for client delivery. No cloud retention policy in-tree. |
+| 3 | Evidence retention / encryption? | **Local ephemeral artifacts.** `ariadne pack --encrypt --pubkey <file>` — prefer **age**; never rely on host GPG keyrings in Docker/CI. |
 | 4 | Dual attestation for `robots: ignore`? | **No.** Operators are already under assumed authorization; avoid administrative nagging in a tactical CLI. |
 | 5 | Minimum Chromium for CI? | Pin to the Playwright-bundled Chromium version for the locked Playwright release in `pyproject.toml`; document in `ariadne doctor`. |
 | 6 | Escalate by awaiting L2 in middleware? | **No.** Always re-schedule; free the downloader slot (§5.5). |
@@ -1093,25 +1179,24 @@ v1.3.0 elevates Phase 2 physical realities to normative requirements: Playwright
 | 15 | CAPTCHA vs pool checkout timeout? | **Split timeouts:** queue (acquire) vs execution (solve hold). Default 60s / 180s. |
 | 16 | apisnoop large response bodies? | Enforce **`MAX_BODY_SIZE` (2 MiB default)**; truncate bodies, keep EndpointItem metadata. |
 | 17 | Headed Playwright in Docker? | **Xvfb** via `xvfb-run` entrypoint; default `headless=false`. |
+| 18 | L3 unlocker cookies to L1/L2? | **Forbidden.** Set `locked_to_mode=L3`; burn session to leave L3 (§5.4.1). |
+| 19 | CAPTCHA after token fetch? | **InjectionStrategy** plugins: form / JS callback / click — target-specific (§7.7.1). |
+| 20 | Extraction drift under load? | **Circuit breaker** drains and exits critical — no alert spam (§7.10.1). |
+| 21 | GPG in Docker for pack? | **No ambient keyring.** Explicit `--pubkey` file; prefer age/pyrage. |
 
 ### 20.1 Remaining open (non-blocking)
 
 1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP) — mutex semantics must be distributed if so.  
 2. Whether clearance-wait siblings should use a dedicated low-cost “probe” request or full L1 GET after solve.  
 3. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
-4. Exact CAPTCHA vendor adapters and per-vendor execution-timeout defaults (Phase 3).  
+4. Which commercial unlocker vendors to ship first-class adapters for (generic HTTP unlocker URL template vs SDKs).  
 
-v1.2.1 added: mandatory escalation priority vs lease TTL, proxy-burn session lifecycle, Playwright zombie teardown, and root Chromium process recycle.
+v1.3.0 added Phase 2 physical traps: Playwright TLS anchor, split timeouts, MAX_BODY_SIZE, headed+Xvfb.
 
-v1.3.0 adds the four Phase 2 physical traps as normative requirements: **Playwright TLS anchor**, **split queue/execution timeouts**, **`MAX_BODY_SIZE` apisnoop guard**, and **headed+Xvfb Docker stealth**.
+v1.4.0 adds Phase 3 operational traps: **L3 `locked_to_mode`**, **CAPTCHA injection strategies**, **circuit breaker**, and **pubkey-file / age encryption UX**.
 
 ---
 
 ## 21. Next implementation step
 
-Phase 1–2 are implemented in-tree. Proceed to **Phase 3**:
-
-1. CAPTCHA solver plugins that respect `ARIADNE_BROWSER_EXECUTION_TIMEOUT`.  
-2. L3 unlocker adapter.  
-3. Metrics (pool wait, escalations, truncations) and `ariadne pack --encrypt`.  
-4. Canary/drift system and production Docker hardening.  
+Phase 1–4 traps are specified through v1.4.0. Phase 3 code lands in-tree next; Phase 4 remains optional multi-engine work.
