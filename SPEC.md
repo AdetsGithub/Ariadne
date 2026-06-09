@@ -1,8 +1,8 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.4.0  
-**Status:** Phase 1–3 implemented (solvers, unlockers, circuit breaker, evidence pack)  
+**Version:** 1.4.1  
+**Status:** Phase 1–3 shipped; Phase 4 last-mile traps specified (post-solve stagger in-tree; JS AST offload pending)  
 **Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
@@ -43,18 +43,20 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 5. **Playwright Chromium is the TLS anchor (when L2 enabled)** — `curl_cffi` can spoof any JA3; Playwright cannot. Session Sync MUST only select impersonation profiles whose `chromium_major` matches Playwright’s bundled Chromium. UA / Client Hints are derived from that anchored profile — never the reverse, and never rotated across majors during an L2-capable engagement.
 6. **Non-blocking escalation** — L1→L2 never holds a Scrapy downloader slot waiting on the Browser Pool; escalate by re-scheduling into the engine queue.
 7. **One solver per session** — Session Sync mutex ensures a single in-flight WAF solve per `session_id` (no thundering herd).
-8. **Split pool timeouts** — checkout **queue** timeout (acquire a context) is separate from **execution** timeout (CAPTCHA/solve hold). Never apply the queue timeout to the whole L2 task.
-9. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
-10. **Bounded network capture** — `apisnoop` MUST enforce `MAX_BODY_SIZE`; oversize XHR/fetch bodies are dropped after recording URL/method/headers.
-11. **Headed stealth in containers** — prefer full headed Chromium; Docker MUST provide Xvfb (`xvfb-run`) so headed mode works without a physical display.
-12. **No L3 Franken-sessions** — clearance from a commercial unlocker is bound to the vendor’s IP/UA/JA3. Sessions that reach L3 are `locked_to_mode=L3` and MUST NOT de-escalate to L1/L2 with those cookies.
-13. **CAPTCHA injection strategies** — solver plugins return tokens *and* target-specific submit strategies (form / JS callback / click); generic textarea injection is insufficient.
-14. **Circuit breaker on drift** — sustained empty extractions trip the breaker, drain the queue, and exit critically (no alert spam / bandwidth burn).
-15. **Script-friendly evidence encryption** — `ariadne pack --encrypt` uses an explicit recipient public key file (`--pubkey`) and prefers `age` over host GPG keyrings.
-16. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
-17. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
-18. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
-19. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
+8. **Staggered sibling wake-ups** — after clearance is acquired, waiting siblings MUST NOT burst simultaneously; apply fresh-window jitter/stagger (§5.3.3).
+9. **Split pool timeouts** — checkout **queue** timeout (acquire a context) is separate from **execution** timeout (CAPTCHA/solve hold). Never apply the queue timeout to the whole L2 task.
+10. **OPSEC by default** — DNS and WebRTC must not leak the operator host IP through any transport.
+11. **Bounded network capture** — `apisnoop` MUST enforce `MAX_BODY_SIZE`; oversize XHR/fetch bodies are dropped after recording URL/method/headers.
+12. **Headed stealth in containers** — prefer full headed Chromium; Docker MUST provide Xvfb (`xvfb-run`) so headed mode works without a physical display.
+13. **No L3 Franken-sessions** — clearance from a commercial unlocker is bound to the vendor’s IP/UA/JA3. Sessions that reach L3 are `locked_to_mode=L3` and MUST NOT de-escalate to L1/L2 with those cookies.
+14. **CAPTCHA injection strategies** — solver plugins return tokens *and* target-specific submit strategies (form / JS callback / click); generic textarea injection is insufficient.
+15. **Circuit breaker on drift** — sustained empty extractions trip the breaker, drain the queue, and exit critically (no alert spam / bandwidth burn).
+16. **Script-friendly evidence encryption** — `ariadne pack --encrypt` uses an explicit recipient public key file (`--pubkey`) and prefers `age` over host GPG keyrings.
+17. **Offload CPU-bound JS analysis** — large bundle regex/AST MUST NOT run on the reactor thread (§10.3.1).
+18. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
+19. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
+20. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
+21. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
 
 ---
 
@@ -130,6 +132,8 @@ Use `obey` only when the ROE or client explicitly requires crawl-delay / disallo
 | G18 | CAPTCHA token actually submits | Injection strategy plugins succeed on fixture Turnstile/reCAPTCHA flows |
 | G19 | Drift stops the crawl | Circuit breaker trips on sustained empty extractions; engine drains and exits critical |
 | G20 | Encrypt without GPG keyring hell | `pack --encrypt --pubkey file.asc` (or age recipient) works in Docker/CI without `~/.gnupg` |
+| G21 | No post-solve micro-herd | Sibling wake-ups after clearance are staggered within the fresh window |
+| G22 | Reactor stays responsive under JS analysis | Heavy JS path extraction never blocks AsyncioSelectorReactor |
 
 ### 3.2 Non-goals
 
@@ -300,7 +304,7 @@ If N concurrent L1 requests share `session_id_A` and all hit Cloudflare Turnstil
 
 1. `try_begin_challenge(session_id) -> bool` — atomically transitions `idle|failed → solving` and grants the lock to exactly one waiter; returns `false` if already `solving`.  
 2. The lock holder is the **only** request allowed to checkout an L2 context for solving that session’s WAF.  
-3. Sibling requests that lose the race MUST **re-schedule** with jittered delay (`meta['waiting_for_clearance']=True`), free their downloader slot, and retry L1 after `challenge_state` becomes `solved` (or re-compete if `failed`).  
+3. Sibling requests that lose the race MUST **re-schedule** with jittered delay (`meta['waiting_for_clearance']=True`), free their downloader slot, and retry L1 after `challenge_state` becomes `solved` (or re-compete if `failed`). On wake, they MUST apply **post-solve stagger** (§5.3.3) so they do not fire as a simultaneous burst.  
 4. Lock lease has a TTL (configurable, e.g. 120s); expired leases auto-fail to `failed` so the crawl cannot deadlock.  
 5. Cookie jar writes during `solving` are exclusive to the lock holder; others must not mutate clearance cookies.  
 
@@ -315,7 +319,7 @@ L1 × N hit challenge for session_A
    ▼              ▼
  re-schedule     re-schedule with delay
  escalate_to=L2  waiting_for_clearance=True
- (single solve)  (poll / retry L1 after solved)
+ (single solve)  (poll / retry L1 after solved + stagger)
 ```
 
 #### 5.3.2 Playwright Chromium TLS anchor (L1↔L2 fingerprint reality gap)
@@ -333,6 +337,31 @@ L1 × N hit challenge for session_A
 7. When Playwright upgrades (e.g. to Chrome 133), the catalog MUST gain a matching `chrome133` curl_cffi profile before L2 engagements proceed.
 
 **When L2 is disabled (L1-only map/extract):** the full catalog (including Firefox) may be used; TLS anchor filtering is not required.
+
+#### 5.3.3 Post-solve sibling stagger (micro-herd prevention)
+
+**The trap:** The challenge mutex prevents N simultaneous L2 solves. When the lock holder releases `challenge_state=solved`, all N−1 siblings waiting with `waiting_for_clearance=True` can evaluate “solved” in the same reactor tick and fire full L1 GETs from one residential sticky IP in the same millisecond — tripping DataDome cadence / Cloudflare rate limits and burning the fresh clearance.
+
+**MUST:**
+
+1. Record `clearance_solved_at` when transitioning to `solved`.  
+2. While clearance age is within `ARIADNE_CLEARANCE_FRESH_WINDOW` (default **5s**), each waking sibling MUST delay before the L1 fetch.  
+3. Delay policy (configurable): either `stagger_base * sibling_wake_index` (capped at `stagger_max`) **or** uniform jitter in `[stagger_base, stagger_max]` (default **0.5s–5.0s** jitter).  
+4. Delay MUST free/yield the event loop (`asyncio.sleep` / Deferred) — never busy-wait.  
+5. After the fresh window, siblings may proceed without stagger (clearance is no longer “hot”).  
+6. `sibling_wake_index` resets on each new solve epoch (`clearance_epoch` bump).
+
+```text
+solve → challenge_state=solved, clearance_solved_at=now
+        │
+        ▼
+ siblings wake (waiting_for_clearance)
+        │
+        ▼
+ age < fresh_window?
+   yes → sleep(stagger) → L1 GET
+   no  → L1 GET immediately
+```
 
 ### 5.4 Progressive downloader strategy
 
@@ -858,9 +887,21 @@ L2 request (later) → PlaywrightPoolDownloadHandler
 ### 10.3 Middlewares (Spider)
 
 1. **LinkNormalizer** — canonicalize, strip tracking params (configurable)  
-2. **JsRouteHintExtractor** — regex/AST-lite extraction of paths from JS  
+2. **JsRouteHintExtractor** — regex/AST-lite extraction of paths from JS (**MUST** offload CPU — §10.3.1)  
 3. **RobotsHintEmitter** — promote Disallow paths to inventory under `observe`  
 4. **DefenseEventEmitter** — structured challenge events  
+
+#### 10.3.1 JsRouteHintExtractor — reactor offload (event-loop starvation)
+
+**The trap:** Modern JS bundles are often 5–20 MB of minified code. Regex or AST-lite parsing over such payloads can take hundreds of milliseconds of CPU. Scrapy’s single Python thread + `AsyncioSelectorReactor` means that work inside a spider middleware **stalls** in-flight downloads, Playwright IPC, and timers — cascading timeouts across the crawl.
+
+**MUST:**
+
+1. Never run heavy JS path extraction synchronously on the reactor/middleware call stack.  
+2. Copy or hand off the JS body to a worker via `asyncio.to_thread` or a bounded `ProcessPoolExecutor`.  
+3. Yield control back to the reactor while the future runs; when complete, emit `EndpointItem`s / follow Requests.  
+4. Cap input size (e.g. skip or sample beyond a configured max bytes) so pathological bundles cannot monopolize the pool.  
+5. Prefer process pool for true parallelism on multi-core hosts when AST parsing is CPU-heavy; thread pool is acceptable for lighter regex passes that release the GIL poorly.
 
 ### 10.4 Pipelines
 
@@ -1029,7 +1070,9 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 
 ### Phase 4 — Advanced (optional)
 
-- Multi-engine fingerprint profiles, JS bundle static analysis for routes, optional AI extraction, SeleniumBase UC **only if** Playwright path proven insufficient for a documented target class  
+- Multi-engine fingerprint profiles; optional AI extraction; SeleniumBase UC **only if** Playwright path proven insufficient for a documented target class  
+- **JsRouteHintExtractor** with **reactor offload** (`asyncio.to_thread` / process pool) — §10.3.1  
+- Post-solve sibling stagger is **already normative** (§5.3.3) and implemented with Phase 3 ship  
 
 ---
 
@@ -1044,6 +1087,7 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 7. Browser Pool reuses contexts; per-request browser launch is not the default path.  
 8. **Concurrency:** with `CONCURRENT_REQUESTS=16` and `pool_size=4`, a synthetic challenge storm on many URLs does not prevent unrelated non-challenge L1 requests from completing (escalation frees slots via re-schedule).  
 9. **Thundering herd:** N concurrent challenges for one `session_id` result in exactly one L2 solve attempt; siblings wait on clearance.  
+9a. **Post-solve micro-herd:** after solve, N siblings do not fire L1 in the same millisecond; stagger applies within the fresh window (§5.3.3).  
 10. **DupeFilter:** re-scheduled L2 request for a URL already fetched at L1 is not silently dropped.  
 11. **Split timeouts:** a simulated 90s CAPTCHA hold does not fail solely because `checkout_timeout=60`; execution timeout governs the hold.  
 12. **apisnoop OOM:** a >`MAX_BODY_SIZE` XHR fixture yields an EndpointItem with `body_truncated=true` and no full body attached.  
@@ -1066,6 +1110,8 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 | Twisted/asyncio impedance | Timeouts, deadlocks | Mandatory AsyncioSelectorReactor; non-blocking pool checkout |
 | Downloader slot starvation on escalate | Engine freeze under WAF storms | Re-schedule L2; never await pool inside L1 middleware (§5.5) |
 | Challenge thundering herd | Wasted solves, IP challenge loops, cookie races | Per-session challenge mutex (§5.3.1) |
+| Post-solve micro-herd | Fresh clearance burned by cadence/rate limits | Sibling stagger within fresh window (§5.3.3) |
+| JS AST on reactor thread | Event-loop stall; cascading timeouts | Offload to thread/process pool (§10.3.1) |
 | RFPDupeFilter drops L2 retry | Silent “success” with no bypass | TransportAwareDupeFilter + `dont_filter` on escalate (§5.6) |
 | UA/profile mismatch | Instant Akamai/CF block | Profile-sourced personas only (§7.2) |
 | L1↔L2 Chromium major drift | Clearance invalidated on handoff | Playwright major is TLS anchor (§5.3.2); fail closed if no catalog match |
@@ -1156,6 +1202,8 @@ v1.3.0 elevates Phase 2 physical realities to normative requirements: Playwright
 
 v1.4.0 adds Phase 3 traps: L3 **`locked_to_mode`** (no Franken-sessions), CAPTCHA **injection strategies**, **circuit breaker** on extraction drift, and **pubkey-file / age** pack encryption.
 
+v1.4.1 adds last-mile traps: **post-solve sibling stagger** (micro-herd) and **JS AST reactor offload** for Phase 4.
+
 ---
 
 ## 20. Decisions (resolved)
@@ -1183,20 +1231,25 @@ v1.4.0 adds Phase 3 traps: L3 **`locked_to_mode`** (no Franken-sessions), CAPTCH
 | 19 | CAPTCHA after token fetch? | **InjectionStrategy** plugins: form / JS callback / click — target-specific (§7.7.1). |
 | 20 | Extraction drift under load? | **Circuit breaker** drains and exits critical — no alert spam (§7.10.1). |
 | 21 | GPG in Docker for pack? | **No ambient keyring.** Explicit `--pubkey` file; prefer age/pyrage. |
+| 22 | Sibling wake after solve — probe vs full GET? | **Full L1 GET**, but **staggered** within `CLEARANCE_FRESH_WINDOW` (§5.3.3). No simultaneous burst. |
+| 23 | Heavy JS route extraction where? | **Off reactor** via `asyncio.to_thread` / process pool (§10.3.1). |
 
 ### 20.1 Remaining open (non-blocking)
 
 1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP) — mutex semantics must be distributed if so.  
-2. Whether clearance-wait siblings should use a dedicated low-cost “probe” request or full L1 GET after solve.  
-3. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
-4. Which commercial unlocker vendors to ship first-class adapters for (generic HTTP unlocker URL template vs SDKs).  
+2. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
+3. Which commercial unlocker vendors to ship first-class adapters for (generic HTTP unlocker URL template vs SDKs).  
 
 v1.3.0 added Phase 2 physical traps: Playwright TLS anchor, split timeouts, MAX_BODY_SIZE, headed+Xvfb.
 
 v1.4.0 adds Phase 3 operational traps: **L3 `locked_to_mode`**, **CAPTCHA injection strategies**, **circuit breaker**, and **pubkey-file / age encryption UX**.
 
+v1.4.1 resolves post-solve **micro-herd stagger** (§5.3.3 / decision 22) and specifies **JS AST reactor offload** (§10.3.1 / decision 23) for Phase 4.
+
 ---
 
 ## 21. Next implementation step
 
-Phase 1–4 traps are specified through v1.4.0. Phase 3 code lands in-tree next; Phase 4 remains optional multi-engine work.
+**Phase 1–3 are shipped.** Operators may run engagements with L0–L3, Session Sync, circuit breaker, and encrypted packs.
+
+**Phase 4 (optional):** implement `JsRouteHintExtractor` with mandatory offload (§10.3.1); multi-engine / AI extract only if required by a documented target class.
