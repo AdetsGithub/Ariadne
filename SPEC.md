@@ -1,9 +1,10 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.4.1  
-**Status:** Phase 1–3 shipped; Phase 4 last-mile traps specified (post-solve stagger in-tree; JS AST offload pending)  
+**Version:** 1.4.2  
+**Status:** Phase 1–3 shipped; Phase 4 edge traps specified (GIL/process-pool, transparent proxy IP, L3 financial breaker, robots honeypot, OS-level Chromium kill)  
 **Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
+**Deployment model:** **Single-node CLI** (one Scrapy process per engagement) is the supported production posture; distributed Session Sync is explicitly out of MVP  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
 ---
@@ -52,11 +53,15 @@ Ariadne must defeat or gracefully degrade across these layers **within authorize
 14. **CAPTCHA injection strategies** — solver plugins return tokens *and* target-specific submit strategies (form / JS callback / click); generic textarea injection is insufficient.
 15. **Circuit breaker on drift** — sustained empty extractions trip the breaker, drain the queue, and exit critically (no alert spam / bandwidth burn).
 16. **Script-friendly evidence encryption** — `ariadne pack --encrypt` uses an explicit recipient public key file (`--pubkey`) and prefers `age` over host GPG keyrings.
-17. **Offload CPU-bound JS analysis** — large bundle regex/AST MUST NOT run on the reactor thread (§10.3.1).
-18. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
-19. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
-20. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
-21. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
+17. **Offload CPU-bound JS analysis** — large bundle regex/AST MUST use a **`ProcessPoolExecutor`** (not threads) past a trivial size threshold (§10.3.1).  
+18. **Detect transparent proxy IP rotation** — sticky endpoint ≠ sticky exit IP; clearance bind follows the exit IP (§5.3.4).  
+19. **L3 fails fast on drift** — paid unlocker empty extractions trip a tighter financial circuit breaker (§7.10.2).  
+20. **Robots Disallow ≠ free crawl queue** — `observe` inventories hints; fetches use honeypot-class defer/rate policy (§2.3.1).  
+21. **OS-level Chromium reaping** — do not rely solely on Playwright `browser.close()` during chaotic reactor shutdown (§10.5).  
+22. **Security-useful output** — crawl results are recon products (endpoints, params, tech stack, defenses), not only scraped fields.
+23. **Conditional evidence** — heavy artifacts (HAR, screenshots) only on challenges, errors, auth transitions, or explicit `apisnoop`.
+24. **Observability** — every block, challenge, and escalation is logged for operator awareness and report evidence.
+25. **Maintainability** — site layout drift and anti-bot evolution are expected; monitoring and fallback selectors are built in.
 
 ---
 
@@ -99,8 +104,12 @@ For commodity scrapers, `obey` is polite. For security testing it is often an **
 
 1. Fetch and parse `robots.txt` / sitemaps when present.  
 2. Emit `RobotsHintItem` entries for every `Disallow` / interesting `Allow` path (scoped to allowlisted hosts).  
-3. Continue crawling those paths subject to normal scope + rate rules.  
-4. Record that the path was robots-disallowed in artifacts for the report (transparency to the client).
+3. **Do not aggressively crawl every Disallow path as organic links.** WAFs seed synthetic traps (e.g. `/wp-admin/db-backup.sql.gz`); blind follow self-incriminates and burns residential IPs.  
+4. Apply `ARIADNE_ROBOTS_HINT_POLICY` before any fetch:
+   - `inventory_only` — record hints only (safest).  
+   - `defer` (**default**) — schedule with honeypot-class handling (`honeypot_suspect` / L2 validate) **and** severe rate limit / low priority vs organic links.  
+   - `follow` — crawl under normal scope (only when ROE explicitly wants aggressive Disallow probing).  
+5. Record that the path was robots-disallowed in artifacts for the report (transparency to the client).
 
 Use `obey` only when the ROE or client explicitly requires crawl-delay / disallow compliance.
 
@@ -133,7 +142,10 @@ Use `obey` only when the ROE or client explicitly requires crawl-delay / disallo
 | G19 | Drift stops the crawl | Circuit breaker trips on sustained empty extractions; engine drains and exits critical |
 | G20 | Encrypt without GPG keyring hell | `pack --encrypt --pubkey file.asc` (or age recipient) works in Docker/CI without `~/.gnupg` |
 | G21 | No post-solve micro-herd | Sibling wake-ups after clearance are staggered within the fresh window |
-| G22 | Reactor stays responsive under JS analysis | Heavy JS path extraction never blocks AsyncioSelectorReactor |
+| G22 | Reactor stays responsive under JS analysis | Heavy JS path extraction uses **ProcessPoolExecutor**; reactor never runs AST/regex on large bundles |
+| G23 | Survive transparent proxy IP rotation | Immediate L1 re-challenge after L2 solve triggers sticky-session cycle; optional exit-IP canary |
+| G24 | L3 budget safety | L3-locked empty extractions trip a tighter financial circuit breaker |
+| G25 | Robots Disallow traps | Disallow paths are deferred/rate-limited — not organic-priority crawl fuel |
 
 ### 3.2 Non-goals
 
@@ -242,7 +254,7 @@ Spinning up a new Chromium + context per request is too slow and burns fingerpri
 | Deadlock avoidance | Checkout timeouts; never hold Scrapy downloader slots while waiting unbounded; release on cancel/errback |
 | Recycling | Contexts recycled after N pages, idle TTL, or clearance invalidation |
 | Root browser recycle | After **MaxContextsServed** (e.g. 5,000) on a Chromium process: spawn a second browser, route new checkouts there, drain old contexts, then `browser.close()` the drained process (Chromium process-level leak mitigation) |
-| Graceful teardown | `BrowserPoolExtension` MUST handle `engine_stopped` and trap SIGINT/SIGTERM to `await browser.close()` on all pooled browsers **before** the asyncio reactor finalizes — prevents zombie Chromium after cancelled runs |
+| Graceful teardown | `BrowserPoolExtension` MUST handle `engine_stopped` and trap SIGINT/SIGTERM to `await browser.close()` **and** Docker/entrypoint MUST reap Chromium via process-group kill (§10.5.1) — Python close alone is insufficient under chaotic asyncio shutdown |
 | Scheduler interaction | Download handler awaits checkout with **queue timeout** only for requests **already** marked `meta['transport_mode']=L2`; never block an L1 slot awaiting pool capacity (see §5.5) |
 
 #### 5.2.1 Split timeouts — queue vs execution (CAPTCHA pool exhaustion)
@@ -362,6 +374,18 @@ solve → challenge_state=solved, clearance_solved_at=now
    yes → sleep(stagger) → L1 GET
    no  → L1 GET immediately
 ```
+
+#### 5.3.4 Transparent sticky-proxy IP rotation
+
+**The trap:** Residential vendors often keep the same sticky session ID/port while **silently swapping the exit IP** when a node dies. Ariadne still targets the same proxy URL; Akamai/Cloudflare invalidate IP-bound clearance; L1 gets an instant challenge; naive escalate→solve→L1 loops burn CAPTCHA budget.
+
+**MUST:**
+
+1. **Passive detection (default):** If L2 recently set `challenge_state=solved`, and the **next** L1 fetch for that `session_id` receives a challenge / clearance-invalid response within `ARIADNE_TRANSPARENT_IP_WINDOW` (default **60s**), treat as transparent IP rotation: `burn_sticky_proxy` (drop clearance, **cycle sticky session ID / endpoint**, keep persona), then re-escalate once.  
+2. **Active detection (optional, engagement flag):** Periodically GET an echo service through the sticky proxy; if observed exit IP ≠ `session.clearance_exit_ip` recorded at solve time, burn sticky immediately.  
+3. Record `clearance_exit_ip` when known.  
+4. Emit `DefenseEvent` type `transparent_ip_rotation`.  
+5. Cap consecutive transparent-rotation burns per session (default **3**) to avoid infinite burn loops on a bad pool.
 
 ### 5.4 Progressive downloader strategy
 
@@ -728,6 +752,20 @@ A UI/XPath drift can yield thousands of HTTP 200 pages with **empty** extraction
 
 Canary mode (§7.1) remains for proactive light checks; the circuit breaker protects full crawls from silent hollow success.
 
+#### 7.10.2 L3 financial circuit breaker
+
+Empty extractions on L0/L1 waste proxy bandwidth. Empty extractions on **L3 unlockers** often bill **per HTTP 200**, regardless of DOM usefulness — a pagination loop under UI drift can burn the client budget in minutes.
+
+**MUST** apply stricter thresholds when `transport_mode_used == L3_unlocker` or `locked_to_mode == L3_unlocker`:
+
+| Parameter | L0/L1/L2 default | L3 default |
+| --- | --- | --- |
+| `window` | 50 | **10** (`ARIADNE_CIRCUIT_L3_WINDOW`) |
+| `empty_ratio_threshold` | 0.50 | **0.40** (`ARIADNE_CIRCUIT_L3_EMPTY_RATIO`) |
+| `min_samples` | 20 | **5** (`ARIADNE_CIRCUIT_L3_MIN_SAMPLES`) |
+
+On L3 trip: same drain/exit behavior with reason `extraction_drift_l3` (or `extraction_drift` with stats flag `ariadne/circuit_breaker_l3=1`).
+
 ---
 
 ## 8. Non-functional requirements
@@ -891,17 +929,20 @@ L2 request (later) → PlaywrightPoolDownloadHandler
 3. **RobotsHintEmitter** — promote Disallow paths to inventory under `observe`  
 4. **DefenseEventEmitter** — structured challenge events  
 
-#### 10.3.1 JsRouteHintExtractor — reactor offload (event-loop starvation)
+#### 10.3.1 JsRouteHintExtractor — reactor offload (GIL / event-loop starvation)
 
-**The trap:** Modern JS bundles are often 5–20 MB of minified code. Regex or AST-lite parsing over such payloads can take hundreds of milliseconds of CPU. Scrapy’s single Python thread + `AsyncioSelectorReactor` means that work inside a spider middleware **stalls** in-flight downloads, Playwright IPC, and timers — cascading timeouts across the crawl.
+**The trap:** Modern JS bundles are often 5–20 MB of minified code. Regex or AST-lite parsing can take hundreds of milliseconds of CPU. Scrapy’s single Python thread + `AsyncioSelectorReactor` means synchronous work in a spider middleware **stalls** in-flight downloads, Playwright IPC, and timers.
+
+**GIL trap:** `asyncio.to_thread` uses a `ThreadPoolExecutor`. CPython’s GIL is **not** released during heavy pure-Python AST walks or many regex workloads. A “background” thread can still freeze the main thread’s event loop — Playwright IPC and timeout callbacks hang.
 
 **MUST:**
 
 1. Never run heavy JS path extraction synchronously on the reactor/middleware call stack.  
-2. Copy or hand off the JS body to a worker via `asyncio.to_thread` or a bounded `ProcessPoolExecutor`.  
-3. Yield control back to the reactor while the future runs; when complete, emit `EndpointItem`s / follow Requests.  
-4. Cap input size (e.g. skip or sample beyond a configured max bytes) so pathological bundles cannot monopolize the pool.  
-5. Prefer process pool for true parallelism on multi-core hosts when AST parsing is CPU-heavy; thread pool is acceptable for lighter regex passes that release the GIL poorly.
+2. For payloads above `ARIADNE_JS_PARSE_THREAD_MAX_BYTES` (default **64 KiB**): hand off exclusively to a bounded **`ProcessPoolExecutor`** (true multi-core, no GIL).  
+3. `asyncio.to_thread` / threads are allowed **only** below that threshold, or when calling a C extension that is documented to release the GIL (e.g. carefully bounded `re` / `lxml` passes). Prefer process pool whenever unsure.  
+4. Yield control to the reactor while the future runs; then emit `EndpointItem`s / follow Requests.  
+5. Cap absolute input size (skip or sample beyond `ARIADNE_JS_PARSE_MAX_BYTES`) so pathological bundles cannot monopolize the pool.  
+6. Bound pool size (e.g. `min(4, cpu_count)`); never unbounded process spawn per response.
 
 ### 10.4 Pipelines
 
@@ -915,11 +956,22 @@ L2 request (later) → PlaywrightPoolDownloadHandler
 
 1. Engagement banner (logs authorization metadata at start)  
 2. **AsyncioReactorGuard** — abort if wrong reactor  
-3. **BrowserPoolExtension** — start/stop pool; **MUST** close all Playwright browsers on `engine_stopped` and on SIGINT/SIGTERM before reactor teardown (no zombie Chromium); recycle root browser after MaxContextsServed; expose separate checkout vs execution timeouts  
+3. **BrowserPoolExtension** — start/stop pool; **MUST** close all Playwright browsers on `engine_stopped` and on SIGINT/SIGTERM before reactor teardown (no zombie Chromium); recycle root browser after MaxContextsServed; expose separate checkout vs execution timeouts. **Additionally** (§10.5.1): OS-level process-group reaping — Python-level `browser.close()` is necessary but insufficient under chaotic asyncio shutdown.  
 4. **SessionSyncExtension** — process-lifetime session store; detect Playwright Chromium major and filter profiles (TLS anchor); expose `burn_proxy(session_id)` for sticky-IP death → drop clearance → rotate proxy → re-escalate  
 5. Kill-switch watcher  
-6. Metrics exporter (include pool wait time, escalation counts, challenge-lock waiters, re-schedule rate, browser process recycles, body truncations)  
+6. Metrics exporter (include pool wait time, escalation counts, challenge-lock waiters, re-schedule rate, browser process recycles, body truncations, transparent IP burns, L3 circuit trips)  
 7. Canary scheduler  
+
+#### 10.5.1 OS-level Chromium reaping (zombie teardown)
+
+**The trap:** Under `AsyncioSelectorReactor`, SIGINT/SIGTERM may cancel tasks and sever the Playwright Node IPC pipe **before** `browser.close()` completes. Orphaned Chromium processes remain.
+
+**MUST:**
+
+1. Keep Python-level close on `engine_stopped` / signals / `atexit` (best effort).  
+2. Docker entrypoint **MUST NOT** sole-rely on `exec` without a reaper: wrap the process, `trap` EXIT/INT/TERM, and on exit run process-group cleanup (e.g. `pkill -P $$` and/or kill the session’s process group).  
+3. Prefer launching Chromium in a dedicated process group when feasible so the parent can `kill(-pgid, SIGTERM)`.  
+4. Document that operators running bare metal should use the same entrypoint pattern or an equivalent systemd `KillMode=control-group`.
 
 ### 10.6 DupeFilter
 
@@ -1070,9 +1122,13 @@ ariadne doctor --leak-check # DNS/WebRTC leak canary + WebRTC launch-arg check
 
 ### Phase 4 — Advanced (optional)
 
-- Multi-engine fingerprint profiles; optional AI extraction; SeleniumBase UC **only if** Playwright path proven insufficient for a documented target class  
-- **JsRouteHintExtractor** with **reactor offload** (`asyncio.to_thread` / process pool) — §10.3.1  
-- Post-solve sibling stagger is **already normative** (§5.3.3) and implemented with Phase 3 ship  
+- **JsRouteHintExtractor** with **ProcessPoolExecutor** offload (§10.3.1) — not `asyncio.to_thread` for large bundles  
+- Passive transparent IP rotation + optional active exit-IP canary (§5.3.4)  
+- L3 financial circuit breaker thresholds (§7.10.2)  
+- Robots Disallow `defer` / `inventory_only` policy (§2.3.1)  
+- OS-level Chromium reaping in Docker entrypoint (§10.5.1)  
+- Multi-engine / AI extract / SeleniumBase UC **only if** Playwright path proven insufficient for a documented target class  
+- **Not in scope unless approved:** Redis Session Sync / Scrapy Cluster (decision 28)  
 
 ---
 
@@ -1232,13 +1288,18 @@ v1.4.1 adds last-mile traps: **post-solve sibling stagger** (micro-herd) and **J
 | 20 | Extraction drift under load? | **Circuit breaker** drains and exits critical — no alert spam (§7.10.1). |
 | 21 | GPG in Docker for pack? | **No ambient keyring.** Explicit `--pubkey` file; prefer age/pyrage. |
 | 22 | Sibling wake after solve — probe vs full GET? | **Full L1 GET**, but **staggered** within `CLEARANCE_FRESH_WINDOW` (§5.3.3). No simultaneous burst. |
-| 23 | Heavy JS route extraction where? | **Off reactor** via `asyncio.to_thread` / process pool (§10.3.1). |
+| 23 | Heavy JS route extraction where? | **`ProcessPoolExecutor` above trivial threshold** — threads/`to_thread` insufficient under GIL (§10.3.1). |
+| 24 | Transparent sticky IP rotation? | Passive: L1 re-challenge soon after L2 solve → burn sticky + cycle session; optional active exit-IP echo (§5.3.4). |
+| 25 | L3 empty extractions? | **Tighter financial circuit breaker** (`extraction_drift_l3`) (§7.10.2). |
+| 26 | Crawl all robots Disallow? | **No.** Default `defer` (honeypot-class + rate limit) or `inventory_only` (§2.3.1). |
+| 27 | Playwright close enough on SIGTERM? | **No.** Also OS process-group reaping in Docker entrypoint (§10.5.1). |
+| 28 | Single-node vs Scrapy Cluster / K8s? | **Single-node CLI is the supported model.** In-process Session Sync + challenge mutex. Redis/distributed mutex is a deliberate post-MVP only if multi-process concurrency is required. |
 
 ### 20.1 Remaining open (non-blocking)
 
-1. Optional Redis-backed Session Sync for multi-process Scrapy clusters (post-MVP) — mutex semantics must be distributed if so.  
-2. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
-3. Which commercial unlocker vendors to ship first-class adapters for (generic HTTP unlocker URL template vs SDKs).  
+1. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
+2. Which commercial unlocker vendors to ship first-class adapters for (generic HTTP unlocker URL template vs SDKs).  
+3. Active exit-IP echo endpoint URL defaults / privacy implications per client ROE.  
 
 v1.3.0 added Phase 2 physical traps: Playwright TLS anchor, split timeouts, MAX_BODY_SIZE, headed+Xvfb.
 
@@ -1246,10 +1307,12 @@ v1.4.0 adds Phase 3 operational traps: **L3 `locked_to_mode`**, **CAPTCHA inject
 
 v1.4.1 resolves post-solve **micro-herd stagger** (§5.3.3 / decision 22) and specifies **JS AST reactor offload** (§10.3.1 / decision 23) for Phase 4.
 
+v1.4.2 tightens Phase 4 edge cases: **GIL→ProcessPool mandate**, **transparent proxy IP**, **L3 financial breaker**, **robots Disallow honeypot policy**, **OS-level Chromium reaping**; locks deployment model to **single-node CLI** (decision 28).
+
 ---
 
 ## 21. Next implementation step
 
-**Phase 1–3 are shipped.** Operators may run engagements with L0–L3, Session Sync, circuit breaker, and encrypted packs.
+**Phase 1–3 are shipped** on `main` for single-node operators.
 
-**Phase 4 (optional):** implement `JsRouteHintExtractor` with mandatory offload (§10.3.1); multi-engine / AI extract only if required by a documented target class.
+**Phase 4 (optional):** `JsRouteHintExtractor` with **ProcessPoolExecutor**; active exit-IP canary; multi-engine/AI only if a documented target class requires it. **Do not** build Redis Session Sync until a concrete multi-process deployment is approved.
