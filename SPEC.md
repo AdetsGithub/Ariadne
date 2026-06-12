@@ -7,6 +7,8 @@
 **Deployment model:** **Single-node CLI** (one Scrapy process per engagement) is the supported production posture; distributed Session Sync is explicitly out of MVP  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
 
+**Operator documentation:** [docs/README.md](./docs/README.md) — runbook, architecture map, configuration reference, troubleshooting. This SPEC remains the normative MUST/MUST NOT source.
+
 ---
 
 ## 1. Purpose
@@ -1342,6 +1344,6 @@ v1.4.3 locks Phase 4 mechanics: L3 trip is an **IgnoreRequest kill-switch** (not
 
 ## 21. Next implementation step
 
-**Phase 1–3 are shipped** on `main` for single-node operators. Phase 4 edge mechanics through **v1.4.3** are specified and partially implemented (L3 kill-switch, canary helper, ProcessPool mandate for future JS extractor).
+**Phase 1–3 are shipped** on `main` for single-node operators. Phase 4 edge mechanics through **v1.4.3** are specified and implemented (L3 kill-switch, canary helper, ProcessPool mandate for future JS extractor). Operator documentation is in [`docs/`](./docs/README.md).
 
 **Phase 4 remaining (optional):** `JsRouteHintExtractor` with **ProcessPoolExecutor**; wire active exit-IP canary scheduler behind `ARIADNE_EXIT_IP_CANARY`; multi-engine/AI only if a documented target class requires it. **Do not** build Redis Session Sync until a concrete multi-process deployment is approved.
