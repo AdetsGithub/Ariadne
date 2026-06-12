@@ -1,8 +1,8 @@
 # Ariadne — Advanced Security Testing Web Scraper
 
 **Document type:** Product & Technical Specification  
-**Version:** 1.4.2  
-**Status:** Phase 1–3 shipped; Phase 4 edge traps specified (GIL/process-pool, transparent proxy IP, L3 financial breaker, robots honeypot, OS-level Chromium kill)  
+**Version:** 1.4.3  
+**Status:** Phase 1–3 shipped; Phase 4 edge traps locked (L3 kill-switch, OPSEC-isolated exit-IP canary)  
 **Primary stack:** Python 3.11+, Scrapy (asyncio reactor), Playwright, curl_cffi  
 **Deployment model:** **Single-node CLI** (one Scrapy process per engagement) is the supported production posture; distributed Session Sync is explicitly out of MVP  
 **Audience:** Red team / offensive security engineers operating under explicit authorization  
@@ -144,8 +144,9 @@ Use `obey` only when the ROE or client explicitly requires crawl-delay / disallo
 | G21 | No post-solve micro-herd | Sibling wake-ups after clearance are staggered within the fresh window |
 | G22 | Reactor stays responsive under JS analysis | Heavy JS path extraction uses **ProcessPoolExecutor**; reactor never runs AST/regex on large bundles |
 | G23 | Survive transparent proxy IP rotation | Immediate L1 re-challenge after L2 solve triggers sticky-session cycle; optional exit-IP canary |
-| G24 | L3 budget safety | L3-locked empty extractions trip a tighter financial circuit breaker |
+| G24 | L3 budget safety | L3 trip arms IgnoreRequest kill-switch — no billed unlocker backlog drain |
 | G25 | Robots Disallow traps | Disallow paths are deferred/rate-limited — not organic-priority crawl fuel |
+| G26 | Exit-IP canary OPSEC | Active canary never carries target cookies/persona/Referer |
 
 ### 3.2 Non-goals
 
@@ -386,6 +387,22 @@ solve → challenge_state=solved, clearance_solved_at=now
 3. Record `clearance_exit_ip` when known.  
 4. Emit `DefenseEvent` type `transparent_ip_rotation`.  
 5. Cap consecutive transparent-rotation burns per session (default **3**) to avoid infinite burn loops on a bad pool.
+
+##### 5.3.4.1 Active exit-IP canary OPSEC isolation
+
+**The trap:** Probing `ifconfig.me` / a custom echo with the **same** L1/L2 session jar attaches target cookies, `Referer`, and persona headers to an unrelated origin. That leaks engagement artifacts to the echo provider and looks anomalous in proxy-provider anti-abuse logs (target cookies → non-target host).
+
+**MUST (active canary only):**
+
+1. Use a **bare L1** request through the **exact sticky proxy port** — no `session_id`, no target cookie jar, no `Referer`/Origin from the engagement host.  
+2. Generic headers only (e.g. `Accept: text/plain`, fixed canary UA) — **not** the Session Sync persona / Sec-CH-UA stack.  
+3. Meta flag `ariadne_exit_ip_canary=true`; SessionSyncMiddleware and PersonaHeadersMiddleware MUST no-op enrichment for that request.  
+4. `dont_merge_cookies` / empty cookies; never reuse L2 storage_state for the canary.  
+5. `dont_merge_cookies` / empty cookies; never reuse L2 storage_state for the canary.  
+6. Skip engagement scope checks for the echo host (`ariadne_skip_scope`) — the canary is not target recon.  
+7. Compare returned IP to `clearance_exit_ip` only; discard body beyond the IP token.
+
+Helper: `ariadne.proxy_canary.build_exit_ip_canary_request(...)`.
 
 ### 5.4 Progressive downloader strategy
 
@@ -764,7 +781,16 @@ Empty extractions on L0/L1 waste proxy bandwidth. Empty extractions on **L3 unlo
 | `empty_ratio_threshold` | 0.50 | **0.40** (`ARIADNE_CIRCUIT_L3_EMPTY_RATIO`) |
 | `min_samples` | 20 | **5** (`ARIADNE_CIRCUIT_L3_MIN_SAMPLES`) |
 
-On L3 trip: same drain/exit behavior with reason `extraction_drift_l3` (or `extraction_drift` with stats flag `ariadne/circuit_breaker_l3=1`).
+**MUST NOT** treat an L3 trip as a polite “graceful drain” of the downloader. Scrapy’s `CloseSpider` stops the scheduler but **allows in-flight downloader slots to finish** — with `CONCURRENT_REQUESTS=16`, that is up to 16 more billed unlocker responses after the trip.
+
+**On L3 trip:**
+
+1. Flip an immediate kill-switch (`trip_kind=l3`) **before** raising `CloseSpider`.  
+2. `CircuitBreakerMiddleware.process_request` (downloader MW, same singleton) MUST `raise IgnoreRequest` for any request with `transport_mode` / `locked_to_mode` = `L3_unlocker`, dropping it **before** it hits the unlocker wire.  
+3. Close with reason `extraction_drift_l3`; stats: `ariadne/circuit_breaker_l3=1`, `ariadne/circuit_breaker_l3_dropped` for each dropped request.  
+4. L0/L1/L2 trips may still drain non-L3 in-flight work (cheap); L3 must not.
+
+Note: TCP already past `process_request` may still complete once — the kill-switch prevents the concurrent backlog and all subsequent scheduler emissions from paying.
 
 ---
 
@@ -1290,16 +1316,17 @@ v1.4.1 adds last-mile traps: **post-solve sibling stagger** (micro-herd) and **J
 | 22 | Sibling wake after solve — probe vs full GET? | **Full L1 GET**, but **staggered** within `CLEARANCE_FRESH_WINDOW` (§5.3.3). No simultaneous burst. |
 | 23 | Heavy JS route extraction where? | **`ProcessPoolExecutor` above trivial threshold** — threads/`to_thread` insufficient under GIL (§10.3.1). |
 | 24 | Transparent sticky IP rotation? | Passive: L1 re-challenge soon after L2 solve → burn sticky + cycle session; optional active exit-IP echo (§5.3.4). |
-| 25 | L3 empty extractions? | **Tighter financial circuit breaker** (`extraction_drift_l3`) (§7.10.2). |
+| 25 | L3 empty extractions? | **Tighter financial circuit breaker** + **IgnoreRequest kill-switch** for L3 — not graceful drain (§7.10.2). |
 | 26 | Crawl all robots Disallow? | **No.** Default `defer` (honeypot-class + rate limit) or `inventory_only` (§2.3.1). |
 | 27 | Playwright close enough on SIGTERM? | **No.** Also OS process-group reaping in Docker entrypoint (§10.5.1). |
 | 28 | Single-node vs Scrapy Cluster / K8s? | **Single-node CLI is the supported model.** In-process Session Sync + challenge mutex. Redis/distributed mutex is a deliberate post-MVP only if multi-process concurrency is required. |
+| 29 | Active exit-IP canary isolation? | **Bare L1 through sticky proxy only** — no target cookies/persona/Referer (§5.3.4.1). |
 
 ### 20.1 Remaining open (non-blocking)
 
 1. Cadence for refreshing `profiles.yaml` when Playwright / `curl_cffi` release new Chromium builds.  
 2. Which commercial unlocker vendors to ship first-class adapters for (generic HTTP unlocker URL template vs SDKs).  
-3. Active exit-IP echo endpoint URL defaults / privacy implications per client ROE.  
+3. Default echo URL for active exit-IP canary (operator-supplied; no hard-coded third-party in core).  
 
 v1.3.0 added Phase 2 physical traps: Playwright TLS anchor, split timeouts, MAX_BODY_SIZE, headed+Xvfb.
 
@@ -1309,10 +1336,12 @@ v1.4.1 resolves post-solve **micro-herd stagger** (§5.3.3 / decision 22) and sp
 
 v1.4.2 tightens Phase 4 edge cases: **GIL→ProcessPool mandate**, **transparent proxy IP**, **L3 financial breaker**, **robots Disallow honeypot policy**, **OS-level Chromium reaping**; locks deployment model to **single-node CLI** (decision 28).
 
+v1.4.3 locks Phase 4 mechanics: L3 trip is an **IgnoreRequest kill-switch** (not graceful drain); active exit-IP canary is **OPSEC-isolated** bare L1 (decision 29).
+
 ---
 
 ## 21. Next implementation step
 
-**Phase 1–3 are shipped** on `main` for single-node operators.
+**Phase 1–3 are shipped** on `main` for single-node operators. Phase 4 edge mechanics through **v1.4.3** are specified and partially implemented (L3 kill-switch, canary helper, ProcessPool mandate for future JS extractor).
 
-**Phase 4 (optional):** `JsRouteHintExtractor` with **ProcessPoolExecutor**; active exit-IP canary; multi-engine/AI only if a documented target class requires it. **Do not** build Redis Session Sync until a concrete multi-process deployment is approved.
+**Phase 4 remaining (optional):** `JsRouteHintExtractor` with **ProcessPoolExecutor**; wire active exit-IP canary scheduler behind `ARIADNE_EXIT_IP_CANARY`; multi-engine/AI only if a documented target class requires it. **Do not** build Redis Session Sync until a concrete multi-process deployment is approved.
