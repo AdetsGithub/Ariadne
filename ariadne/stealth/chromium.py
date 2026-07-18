@@ -64,7 +64,8 @@ def resolve_anchor_profile_ids(
     Filter catalog to profiles compatible with Playwright Chromium major.
 
     If chromium_major is None (no Playwright), return allowlist or full catalog (L1-only).
-    If Playwright is present, ONLY profiles with matching chromium_major are allowed.
+    If Playwright is present, prefer exact chromium_major matches; when curl_cffi lags
+    Playwright, fall back to the nearest catalog major ≤ the anchor (with a warning).
     """
     candidates = list(allowlist) if allowlist else list(catalog_profile_ids)
     if chromium_major is None:
@@ -75,11 +76,31 @@ def resolve_anchor_profile_ids(
         for pid in candidates
         if profile_majors.get(pid) == chromium_major
     ]
-    if not matched:
-        raise ChromiumAnchorError(
-            f"No curl_cffi catalog profile matches Playwright Chromium major {chromium_major}. "
-            f"Available majors: {sorted({v for v in profile_majors.values() if v})} "
-            f"(profile ids: {sorted(catalog_profile_ids)}). "
-            "Upgrade profiles.yaml / curl_cffi so L1 JA3 matches L2's real TLS fingerprint."
+    if matched:
+        return matched
+
+    lower = [
+        (profile_majors[pid], pid)
+        for pid in candidates
+        if profile_majors.get(pid) is not None and profile_majors[pid] <= chromium_major
+    ]
+    if lower:
+        best_major = max(maj for maj, _ in lower)
+        nearest = [pid for maj, pid in lower if maj == best_major]
+        logger.warning(
+            "No curl_cffi catalog profile matches Playwright Chromium major %s; "
+            "using nearest catalog major %s (%s). Clearance handoff may be fragile — "
+            "upgrade profiles.yaml / curl_cffi when an exact match exists.",
+            chromium_major,
+            best_major,
+            nearest,
         )
-    return matched
+        return nearest
+
+    raise ChromiumAnchorError(
+        f"No curl_cffi catalog profile matches Playwright Chromium major {chromium_major}. "
+        f"Available majors: {sorted({v for v in profile_majors.values() if v})} "
+        f"(profile ids: {sorted(catalog_profile_ids)}). "
+        "Upgrade profiles.yaml / curl_cffi so L1 JA3 matches L2's real TLS fingerprint."
+    )
+

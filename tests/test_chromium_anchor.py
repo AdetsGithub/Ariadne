@@ -26,12 +26,26 @@ def test_anchor_filters_to_matching_major():
     assert ids == ["chrome131"]
 
 
-def test_anchor_raises_when_no_match():
+def test_anchor_nearest_when_playwright_ahead():
+    catalog = load_profile_catalog()
+    majors = {pid: m.chromium_major for pid, m in catalog.items()}
+    available = sorted(v for v in majors.values() if v is not None)
+    assert available
+    ids = resolve_anchor_profile_ids(
+        chromium_major=available[-1] + 50,
+        catalog_profile_ids=list(catalog.keys()),
+        profile_majors=majors,
+    )
+    assert ids
+    assert all(majors[i] == available[-1] for i in ids)
+
+
+def test_anchor_raises_when_below_all_majors():
     catalog = load_profile_catalog()
     majors = {pid: m.chromium_major for pid, m in catalog.items()}
     with pytest.raises(ChromiumAnchorError):
         resolve_anchor_profile_ids(
-            chromium_major=999,
+            chromium_major=1,
             catalog_profile_ids=list(catalog.keys()),
             profile_majors=majors,
         )

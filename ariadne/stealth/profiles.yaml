@@ -4,6 +4,9 @@
 # whose `chromium_major` matches Playwright's bundled Chromium. L2 cannot spoof JA3/H2;
 # L1 must claim the same browser build or clearance cookies die on handoff.
 #
+# When curl_cffi lags Playwright, resolve_anchor_profile_ids falls back to the nearest
+# catalog major ≤ Playwright's major (with a warning). Prefer upgrading profiles.yaml.
+#
 # Never invent UAs outside this catalog. Never rotate across majors during an engagement
 # when L2 is enabled.
 
@@ -34,11 +37,64 @@ profiles:
       height: 1080
     family: chrome
 
-  chrome133:
-    impersonate: chrome133
+  # curl_cffi exposes chrome133a (not chrome133)
+  chrome133a:
+    impersonate: chrome133a
     chromium_major: 133
     user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
     sec_ch_ua: '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  chrome136:
+    impersonate: chrome136
+    chromium_major: 136
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  chrome142:
+    impersonate: chrome142
+    chromium_major: 142
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Chromium";v="142", "Google Chrome";v="142", "Not.A/Brand";v="99"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  chrome145:
+    impersonate: chrome145
+    chromium_major: 145
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Chromium";v="145", "Google Chrome";v="145", "Not.A/Brand";v="99"'
+    sec_ch_ua_mobile: "?0"
+    sec_ch_ua_platform: '"Windows"'
+    accept_language: "en-US,en;q=0.9"
+    viewport:
+      width: 1920
+      height: 1080
+    family: chrome
+
+  chrome146:
+    impersonate: chrome146
+    chromium_major: 146
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    sec_ch_ua: '"Chromium";v="146", "Google Chrome";v="146", "Not.A/Brand";v="99"'
     sec_ch_ua_mobile: "?0"
     sec_ch_ua_platform: '"Windows"'
     accept_language: "en-US,en;q=0.9"
