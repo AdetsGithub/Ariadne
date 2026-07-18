@@ -6,7 +6,7 @@ import logging
 from collections import deque
 
 from itemadapter import ItemAdapter
-from scrapy import signals
+from scrapy import Request, signals
 from scrapy.exceptions import CloseSpider, IgnoreRequest
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,12 @@ L3_MODE = "L3_unlocker"
 
 def _extraction_empty(item) -> bool | None:
     """Return True if PageItem-like extraction is empty; None if not applicable."""
-    adapter = ItemAdapter(item)
+    if isinstance(item, Request):
+        return None
+    try:
+        adapter = ItemAdapter(item)
+    except TypeError:
+        return None
     if "extraction" not in adapter.field_names() and "extraction" not in adapter:
         if not hasattr(item, "get"):
             return None
