@@ -84,12 +84,32 @@ class ScopeSpider(scrapy.Spider):
             content_hash=hashlib.sha256(body).hexdigest()[:16],
             scraped_at=datetime.now(timezone.utc).isoformat(),
             extraction=extraction or {},
-            title=response.css("title::text").get(default="").strip(),
+            title=self._safe_title(response),
             defense_events=response.meta.get("defense_events"),
         )
 
+    @staticmethod
+    def _safe_title(response) -> str:
+        try:
+            return (response.css("title::text").get(default="") or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_html_response(response) -> bool:
+        ctype = (response.headers.get(b"Content-Type") or b"").decode("latin-1", "ignore").lower()
+        if "text/html" in ctype or "application/xhtml" in ctype:
+            return True
+        # Some hosts omit Content-Type; treat empty/unknown as HTML only if body looks like markup.
+        if not ctype or "text/plain" in ctype:
+            head = (response.body or b"")[:200].lstrip().lower()
+            return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<title" in head
+        return False
+
     def iter_safe_links(self, response):
         """Yield absolute links, skipping obvious inline honeypots."""
+        if not self._is_html_response(response):
+            return
         for a in response.css("a[href]"):
             href = a.attrib.get("href")
             if not href or href.startswith(("mailto:", "javascript:", "#")):
@@ -103,6 +123,8 @@ class ScopeSpider(scrapy.Spider):
             yield url, suspect
 
     def iter_forms(self, response):
+        if not self._is_html_response(response):
+            return
         for form in response.css("form"):
             fields = []
             for inp in form.css("input[name], select[name], textarea[name]"):

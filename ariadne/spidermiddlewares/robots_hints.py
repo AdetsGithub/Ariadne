@@ -69,9 +69,21 @@ class RobotsHintMiddleware:
         yield from parse_robots_hints(response, respect=self.respect_robots)
 
 
+def _response_text(response: Response) -> str:
+    """Decode response body even when Scrapy marks it non-text (e.g. odd Content-Type)."""
+    try:
+        return response.text
+    except Exception:
+        body = response.body or b""
+        encoding = getattr(response, "encoding", None) or "utf-8"
+        if isinstance(body, str):
+            return body
+        return body.decode(encoding, errors="replace")
+
+
 def parse_robots_hints(response: Response, respect: str = "observe"):
     host = urlparse(response.url).hostname or ""
-    text = response.text
+    text = _response_text(response)
     rp = RobotFileParser()
     try:
         rp.parse(text.splitlines())

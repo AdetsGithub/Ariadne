@@ -42,6 +42,9 @@ class MapSpider(ScopeSpider):
             )
 
     def parse(self, response):
+        # Binary / non-HTML assets are out of scope for map recon.
+        if not self._is_html_response(response):
+            return
         yield self.make_page_item(response, extraction={"kind": "map"})
         yield from self.iter_forms(response)
 
@@ -50,7 +53,14 @@ class MapSpider(ScopeSpider):
         if depth >= max_depth:
             return
 
+        skip_ext = (
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+            ".css", ".js", ".woff", ".woff2", ".ttf", ".mp4", ".pdf", ".zip",
+        )
         for url, suspect in self.iter_safe_links(response):
+            path = (urlparse(url).path or "").lower()
+            if any(path.endswith(ext) for ext in skip_ext):
+                continue
             host = urlparse(url).hostname or ""
             if self.allowed_domains and not any(
                 host == d or host.endswith("." + d) for d in self.allowed_domains

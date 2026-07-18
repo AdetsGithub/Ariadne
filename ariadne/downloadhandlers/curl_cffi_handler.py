@@ -114,8 +114,33 @@ class CurlCffiDownloadHandler:
 
         body = resp.content or b""
         ctype = (resp.headers.get("content-type") or "").lower()
-        if "text/html" in ctype or body.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
+        is_html = "text/html" in ctype or body.lstrip()[:15].lower().startswith(
+            (b"<!doctype", b"<html")
+        )
+        is_text = is_html or any(
+            t in ctype
+            for t in (
+                "text/",
+                "application/json",
+                "application/javascript",
+                "application/xml",
+                "+json",
+                "+xml",
+            )
+        )
+        if is_html:
             return HtmlResponse(
+                url=str(resp.url),
+                status=resp.status_code,
+                headers=resp_headers,
+                body=body,
+                request=request,
+                encoding="utf-8",
+            )
+        if is_text:
+            from scrapy.http import TextResponse
+
+            return TextResponse(
                 url=str(resp.url),
                 status=resp.status_code,
                 headers=resp_headers,
