@@ -120,13 +120,16 @@ def engagement_to_scrapy_settings(cfg: EngagementConfig) -> dict[str, Any]:
     """Map engagement YAML into Scrapy/Ariadne settings overrides."""
     out_dir = Path(cfg.output.dir) / cfg.engagement.id
     mode = cfg.crawl.mode
-    # Real Playwright pool only when the crawl needs L2 up front.
-    # Challenge escalation still uses the L2 stub when the pool is off.
+    # Real Playwright pool when the crawl needs L2 (initial, escalation, or capture).
+    # Without the pool, ChallengeDetect falls back to the L2 stub.
+    escalate = cfg.crawl.transport.escalate_to or []
     enable_browser = (
         mode in {"apisnoop", "auth"}
         or cfg.crawl.transport.initial_mode.startswith("L2")
+        or any(str(m).startswith("L2") for m in escalate)
         or cfg.crawl.browser.capture_network
     )
+
     return {
         "ARIADNE_ENGAGEMENT": cfg.model_dump(mode="json", by_alias=True),
         "ARIADNE_OUTPUT_DIR": str(out_dir),
