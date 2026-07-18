@@ -72,9 +72,10 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 ariadne doctor
-ariadne init engagement.yaml          # or copy engagements/example.yaml
-ariadne validate engagement.yaml
-ariadne crawl -c engagement.yaml
+ariadne init engagement.yaml          # use --force to overwrite an existing file
+# or: cp engagements/example.yaml engagement.yaml
+ariadne validate engagements/example.yaml
+ariadne crawl -c engagements/example.yaml
 ```
 
 ### With Playwright (L2 / apisnoop)

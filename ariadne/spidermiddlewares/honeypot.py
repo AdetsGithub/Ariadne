@@ -28,25 +28,37 @@ def is_inline_honeypot(tag_html: str) -> bool:
 
 
 class HoneypotFilterMiddleware:
-    def __init__(self, l1_unverified: str = "defer"):
+    def __init__(self, crawler, l1_unverified: str = "defer"):
+        self.crawler = crawler
         self.l1_unverified = l1_unverified
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(crawler.settings.get("ARIADNE_HONEYPOT_L1_UNVERIFIED", "defer"))
+        return cls(crawler, crawler.settings.get("ARIADNE_HONEYPOT_L1_UNVERIFIED", "defer"))
 
-    def process_spider_output(self, response: Response, result, spider):
+    def process_spider_output(self, response: Response, result, spider=None):
         mode = response.request.meta.get("transport_mode", "L1_impersonate") if response.request else "L1"
         for item in result:
             if isinstance(item, Request):
-                # Requests already created — check meta flags
                 if item.meta.get("honeypot_suspect") and self.l1_unverified == "defer":
                     if mode.startswith("L1") or mode.startswith("L0"):
                         item.meta["transport_mode"] = "L2_browser"
                         item.meta["honeypot_validate"] = True
                         item.meta["allow_l2_stub"] = True
-                        kind = "robots Disallow" if item.meta.get("from_robots_hint") else "unverified link"
+                        kind = (
+                            "robots Disallow"
+                            if item.meta.get("from_robots_hint")
+                            else "unverified link"
+                        )
                         logger.debug("Deferring %s to L2 validation: %s", kind, item.url)
                 yield item
             else:
                 yield item
+
+    async def process_spider_output_async(self, response: Response, result, spider=None):
+        from ariadne.scrapy_compat import mirror_spider_output
+
+        async for o in mirror_spider_output(
+            self.process_spider_output, response, result, spider
+        ):
+            yield o

@@ -12,11 +12,16 @@ logger = logging.getLogger(__name__)
 
 
 class BackoffMiddleware(RetryMiddleware):
-    def __init__(self, settings):
+    def __init__(self, settings, crawler=None):
         super().__init__(settings)
+        self.crawler = crawler
         self.retry_http_codes = set(settings.getlist("RETRY_HTTP_CODES") or []) | {429, 503}
 
-    def process_response(self, request, response, spider):
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler.settings, crawler)
+
+    def process_response(self, request, response):
         if request.meta.get("dont_retry", False):
             return response
         if response.status in self.retry_http_codes:
@@ -24,7 +29,9 @@ class BackoffMiddleware(RetryMiddleware):
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 try:
-                    delay = float(retry_after.decode() if isinstance(retry_after, bytes) else retry_after)
+                    delay = float(
+                        retry_after.decode() if isinstance(retry_after, bytes) else retry_after
+                    )
                 except (TypeError, ValueError):
                     delay = None
             else:
@@ -34,5 +41,6 @@ class BackoffMiddleware(RetryMiddleware):
                 delay = (2**retries) + random.uniform(0, 1)
             request.meta["download_delay"] = delay
             logger.debug("Backoff %ss for %s (%s)", delay, request.url, reason)
+            spider = self.crawler.spider if self.crawler else None
             return self._retry(request, reason, spider) or response
         return response

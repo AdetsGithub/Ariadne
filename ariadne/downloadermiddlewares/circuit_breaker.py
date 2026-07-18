@@ -118,7 +118,7 @@ class CircuitBreakerMiddleware:
             self.l3_min_samples,
         )
 
-    def process_request(self, request, spider):
+    def process_request(self, request):
         """Downloader path: after L3 trip, never pay for another unlocker fetch."""
         if not self._tripped or self._trip_kind != "l3":
             return None
@@ -129,7 +129,8 @@ class CircuitBreakerMiddleware:
             raise IgnoreRequest("circuit_breaker_l3")
         return None
 
-    def process_spider_output(self, response, result, spider):
+    def process_spider_output(self, response, result, spider=None):
+        spider = spider or (self.crawler.spider if self.crawler else None)
         is_l3 = _is_l3_response(response)
         for item in result:
             empty = None
@@ -143,6 +144,14 @@ class CircuitBreakerMiddleware:
             yield item
             if not self._tripped and empty is not None:
                 self._maybe_trip(spider, l3=is_l3)
+
+    async def process_spider_output_async(self, response, result, spider=None):
+        from ariadne.scrapy_compat import mirror_spider_output
+
+        async for o in mirror_spider_output(
+            self.process_spider_output, response, result, spider
+        ):
+            yield o
 
     def _maybe_trip(self, spider, *, l3: bool):
         if self._tripped:

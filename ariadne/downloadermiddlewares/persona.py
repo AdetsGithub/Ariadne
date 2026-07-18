@@ -8,7 +8,7 @@ from ariadne.stealth import Persona
 
 
 class PersonaHeadersMiddleware:
-    def process_request(self, request: Request, spider):
+    def process_request(self, request: Request):
         if request.meta.get("ariadne_exit_ip_canary"):
             # Bare canary headers only — never overlay target persona / Referer / Sec-CH-UA
             return None

@@ -9,26 +9,27 @@ from itemadapter import ItemAdapter
 
 
 class NdjsonExportPipeline:
-    def __init__(self, output_dir: str):
-        self.output_dir = Path(output_dir)
+    def __init__(self, crawler):
+        self.crawler = crawler
+        self.output_dir = Path(crawler.settings.get("ARIADNE_OUTPUT_DIR", "artifacts"))
         self._handles: dict[str, any] = {}
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(crawler.settings.get("ARIADNE_OUTPUT_DIR", "artifacts"))
+        return cls(crawler)
 
-    def open_spider(self, spider):
+    def open_spider(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         meta_path = self.output_dir / "engagement.json"
-        eng = spider.settings.get("ARIADNE_ENGAGEMENT")
+        eng = self.crawler.settings.get("ARIADNE_ENGAGEMENT")
         if eng:
             meta_path.write_text(json.dumps(eng, indent=2), encoding="utf-8")
 
-    def close_spider(self, spider):
+    def close_spider(self):
         for fh in self._handles.values():
             fh.close()
 
-    def process_item(self, item, spider):
+    def process_item(self, item):
         name = item.__class__.__name__
         path = self.output_dir / f"{name}.ndjson"
         if name not in self._handles:

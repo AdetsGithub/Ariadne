@@ -136,7 +136,11 @@ def test_l3_kill_switch_ignore_request():
     with pytest.raises(IgnoreRequest):
         mw.process_request(
             Request("https://t.example/next", meta={"transport_mode": "L3_unlocker"}),
-            spider,
         )
     # Non-L3 still allowed through process_request (scheduler close handles stop)
-    assert mw.process_request(Request("https://t.example/l1", meta={"transport_mode": "L1_impersonate"}), spider) is None
+    assert (
+        mw.process_request(
+            Request("https://t.example/l1", meta={"transport_mode": "L1_impersonate"})
+        )
+        is None
+    )

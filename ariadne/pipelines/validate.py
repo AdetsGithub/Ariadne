@@ -7,7 +7,7 @@ from scrapy.exceptions import DropItem
 
 
 class ValidatePipeline:
-    def process_item(self, item, spider):
+    def process_item(self, item):
         adapter = ItemAdapter(item)
         if "url" in adapter.field_names() and not adapter.get("url"):
             raise DropItem("missing url")

@@ -1,4 +1,4 @@
-"""curl_cffi download handler — L1 TLS + HTTP/2 impersonation."""
+"""curl_cffi download handler — L1 TLS + HTTP/2 impersonation (Scrapy ≥2.13 async API)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ import logging
 
 from scrapy.core.downloader.handlers.http11 import HTTP11DownloadHandler
 from scrapy.http import Headers, HtmlResponse, Request, Response
-from scrapy.utils.defer import deferred_from_coro
-from twisted.internet.defer import Deferred
 
 logger = logging.getLogger(__name__)
 
@@ -17,56 +15,56 @@ class CurlCffiDownloadHandler:
 
     lazy = False
 
-    def __init__(self, settings, crawler=None):
-        self._settings = settings
-        self._fallback = HTTP11DownloadHandler(settings, crawler)
+    def __init__(self, crawler):
+        self._crawler = crawler
+        self._settings = crawler.settings
+        self._fallback = HTTP11DownloadHandler.from_crawler(crawler)
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(crawler.settings, crawler)
+        return cls(crawler)
 
-    def download_request(self, request: Request, spider) -> Deferred:
+    async def download_request(self, request: Request) -> Response:
         mode = request.meta.get("transport_mode") or self._settings.get(
             "ARIADNE_INITIAL_TRANSPORT", "L1_impersonate"
         )
         if mode in {"L0_http"}:
-            return self._fallback.download_request(request, spider)
+            return await self._fallback.download_request(request)
         if mode in {"L2_browser", "L3_unlocker"}:
             if mode == "L3_unlocker" or request.meta.get("locked_to_mode") == "L3_unlocker":
-                return deferred_from_coro(self._download_l3(request, spider))
+                return await self._download_l3(request)
             if self._settings.getbool("ARIADNE_BROWSER_POOL_ENABLED", False):
                 try:
                     from ariadne.browser import get_browser_pool
 
                     get_browser_pool()  # raises if not ready
-                    return deferred_from_coro(self._download_l2(request, spider))
+                    return await self._download_l2(request)
                 except RuntimeError:
                     logger.warning("BrowserPool not ready; falling back for %s", request.url)
             if request.meta.get("allow_l2_stub"):
-                return deferred_from_coro(self._stub_l2(request, spider))
+                return await self._stub_l2(request)
             logger.warning(
                 "L2 requested but BrowserPool inactive; using L1 curl_cffi for %s",
                 request.url,
             )
-        return deferred_from_coro(self._download_l1(request, spider))
+        return await self._download_l1(request)
 
-    async def _download_l3(self, request: Request, spider) -> Response:
+    async def _download_l3(self, request: Request) -> Response:
         from ariadne.unlockers import download_via_unlocker
 
         return await download_via_unlocker(request, self._settings)
 
-    async def _download_l2(self, request: Request, spider) -> Response:
+    async def _download_l2(self, request: Request) -> Response:
         from ariadne.downloadhandlers.playwright_download import download_with_playwright
 
         try:
             return await download_with_playwright(request, self._settings)
         except TimeoutError as exc:
-            # Free slot already released by pool; re-schedule high priority
             logger.warning("L2 timeout: %s — spider/middleware should re-schedule", exc)
             request.meta["ariadne_requeue_l2"] = True
             raise
 
-    async def _download_l1(self, request: Request, spider) -> Response:
+    async def _download_l1(self, request: Request) -> Response:
         from curl_cffi.requests import AsyncSession
 
         impersonate = request.meta.get("impersonate") or "chrome131"
@@ -104,6 +102,10 @@ class CurlCffiDownloadHandler:
 
         resp_headers = Headers()
         for hk, hv in resp.headers.items():
+            # curl_cffi already decompresses; leaving Content-Encoding makes Scrapy's
+            # HttpCompressionMiddleware try (and fail) to decode again.
+            if str(hk).lower() in {"content-encoding", "content-length"}:
+                continue
             resp_headers.appendlist(hk, hv)
 
         request.meta["ariadne_response_cookies"] = dict(resp.cookies) if resp.cookies else {}
@@ -129,8 +131,8 @@ class CurlCffiDownloadHandler:
             request=request,
         )
 
-    async def _stub_l2(self, request: Request, spider) -> Response:
-        """Phase 1 test stub simulating an L2 solve that sets clearance cookies."""
+    async def _stub_l2(self, request: Request) -> Response:
+        """Test stub simulating an L2 solve that sets clearance cookies."""
         request.meta["transport_mode_used"] = "L2_browser"
         request.meta["ariadne_response_cookies"] = {"cf_clearance": "stub-clearance-token"}
         return HtmlResponse(
@@ -141,5 +143,10 @@ class CurlCffiDownloadHandler:
             encoding="utf-8",
         )
 
-    def close(self):
-        return self._fallback.close()
+    async def close(self):
+        close = getattr(self._fallback, "close", None)
+        if close is None:
+            return
+        result = close()
+        if hasattr(result, "__await__"):
+            await result

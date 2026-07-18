@@ -33,7 +33,7 @@ class SessionSyncMiddleware:
     def spider_opened(self, spider):
         spider.logger.debug("SessionSyncMiddleware ready")
 
-    def process_request(self, request: Request, spider):
+    def process_request(self, request: Request):
         # Exit-IP canary: sticky proxy only — never bind target Session Sync artifacts
         if request.meta.get("ariadne_exit_ip_canary"):
             request.meta["ariadne_cookies"] = {}
@@ -119,7 +119,7 @@ class SessionSyncMiddleware:
 
         await asyncio.sleep(seconds)
 
-    def process_response(self, request, response, spider):
+    def process_response(self, request, response):
         try:
             sync = get_session_sync()
         except RuntimeError:

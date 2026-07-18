@@ -28,11 +28,11 @@ class ChallengeDetectMiddleware:
     def from_crawler(cls, crawler):
         return cls(crawler)
 
-    def process_response(self, request: Request, response: Response, spider):
+    def process_response(self, request: Request, response: Response):
         mode = request.meta.get("transport_mode", "L1_impersonate")
         # Already on L2 stub/solve path — sync clearance if present
         if mode in {"L2_browser", "L3_unlocker"}:
-            return self._finish_l2(request, response, spider)
+            return self._finish_l2(request, response)
 
         match = detect_challenge(response)
         if not match:
@@ -72,9 +72,9 @@ class ChallengeDetectMiddleware:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            spider.crawler.stats.inc_value("ariadne/transparent_ip_rotation")
+            self.crawler.stats.inc_value("ariadne/transparent_ip_rotation")
 
-        spider.crawler.stats.inc_value(f"ariadne/challenge/{match.type}")
+        self.crawler.stats.inc_value(f"ariadne/challenge/{match.type}")
 
         event = DefenseEventItem(
             type=match.type,
@@ -104,7 +104,6 @@ class ChallengeDetectMiddleware:
                 extra["allow_l2_stub"] = True
             return self._reschedule(
                 request,
-                spider,
                 transport_mode=self.escalate_to,
                 waiting_for_clearance=False,
                 extra_meta=extra,
@@ -117,13 +116,12 @@ class ChallengeDetectMiddleware:
         )
         return self._reschedule(
             request,
-            spider,
             transport_mode=mode,
             waiting_for_clearance=True,
             extra_meta={"download_delay": self.wait_delay},
         )
 
-    def _finish_l2(self, request: Request, response: Response, spider):
+    def _finish_l2(self, request: Request, response: Response):
         try:
             sync = get_session_sync()
         except RuntimeError:
@@ -147,7 +145,6 @@ class ChallengeDetectMiddleware:
     def _reschedule(
         self,
         request: Request,
-        spider,
         *,
         transport_mode: str,
         waiting_for_clearance: bool,
@@ -163,11 +160,8 @@ class ChallengeDetectMiddleware:
         meta["escalated"] = True
         if extra_meta:
             meta.update(extra_meta)
-        new_req = request.replace(
+        return request.replace(
             meta=meta,
             dont_filter=True,
             priority=self.priority,
         )
-        # Returning a Request from process_response is supported in Scrapy:
-        # it schedules the request and drops the current response.
-        return new_req

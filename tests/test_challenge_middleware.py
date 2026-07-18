@@ -7,12 +7,6 @@ from ariadne.downloadermiddlewares.challenge import ChallengeDetectMiddleware
 from ariadne.session import SessionSyncService, set_session_sync
 
 
-def _spider(crawler):
-    spider = type("DummySpider", (), {})()
-    spider.crawler = crawler
-    return spider
-
-
 def test_challenge_reschedules_l2_with_priority():
     set_session_sync(SessionSyncService(impersonate_profiles=["chrome124"]))
     crawler = get_crawler(
@@ -32,7 +26,7 @@ def test_challenge_reschedules_l2_with_priority():
     body = b"<html><title>Just a moment...</title>cf-browser-verification</html>"
     resp = HtmlResponse(req.url, status=403, body=body, request=req, encoding="utf-8")
 
-    out = mw.process_response(req, resp, _spider(crawler))
+    out = mw.process_response(req, resp)
     assert isinstance(out, Request)
     assert out.meta["transport_mode"] == "L2_browser"
     assert out.dont_filter is True
@@ -54,7 +48,6 @@ def test_second_challenge_waits_not_second_solve():
     )
     mw = ChallengeDetectMiddleware.from_crawler(crawler)
     body = b"<html><title>Just a moment...</title>cf-browser-verification</html>"
-    spider = _spider(crawler)
 
     r1 = Request(
         "https://example.com/a",
@@ -65,10 +58,10 @@ def test_second_challenge_waits_not_second_solve():
         meta={"transport_mode": "L1_impersonate", "session_id": "host:example.com"},
     )
     out1 = mw.process_response(
-        r1, HtmlResponse(r1.url, status=403, body=body, request=r1, encoding="utf-8"), spider
+        r1, HtmlResponse(r1.url, status=403, body=body, request=r1, encoding="utf-8")
     )
     out2 = mw.process_response(
-        r2, HtmlResponse(r2.url, status=403, body=body, request=r2, encoding="utf-8"), spider
+        r2, HtmlResponse(r2.url, status=403, body=body, request=r2, encoding="utf-8")
     )
     assert out1.meta["transport_mode"] == "L2_browser"
     assert out2.meta.get("waiting_for_clearance") is True

@@ -15,15 +15,17 @@ logger = logging.getLogger(__name__)
 
 
 class RobotsHintMiddleware:
-    def __init__(self, respect_robots: str = "observe"):
+    def __init__(self, crawler, respect_robots: str = "observe"):
+        self.crawler = crawler
         self.respect_robots = respect_robots
         self._fetched: set[str] = set()
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(crawler.settings.get("ARIADNE_RESPECT_ROBOTS", "observe"))
+        return cls(crawler, crawler.settings.get("ARIADNE_RESPECT_ROBOTS", "observe"))
 
-    def process_spider_output(self, response: Response, result, spider):
+    def process_spider_output(self, response: Response, result, spider=None):
+        spider = spider or self.crawler.spider
         for item in result:
             yield item
 
@@ -33,12 +35,16 @@ class RobotsHintMiddleware:
         host = urlparse(response.url).hostname
         if not host or host in self._fetched:
             return
-        # Schedule robots fetch once per host via spider callback if available
         robots_url = urljoin(f"{urlparse(response.url).scheme}://{host}", "/robots.txt")
         self._fetched.add(host)
+        callback = (
+            spider.parse_robots
+            if spider is not None and hasattr(spider, "parse_robots")
+            else self._parse_robots
+        )
         yield Request(
             robots_url,
-            callback=spider.parse_robots if hasattr(spider, "parse_robots") else self._parse_robots,
+            callback=callback,
             meta={
                 "ariadne_skip_scope": False,
                 "transport_mode": "L1_impersonate",
@@ -48,6 +54,14 @@ class RobotsHintMiddleware:
             dont_filter=True,
             priority=50,
         )
+
+    async def process_spider_output_async(self, response: Response, result, spider=None):
+        from ariadne.scrapy_compat import mirror_spider_output
+
+        async for o in mirror_spider_output(
+            self.process_spider_output, response, result, spider
+        ):
+            yield o
 
     def _parse_robots(self, response: Response):
         if response.status != 200:

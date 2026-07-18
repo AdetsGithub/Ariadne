@@ -26,7 +26,7 @@ class ProxyMiddleware:
             crawler.settings.get("ARIADNE_PROXY_LIST"),
         )
 
-    def process_request(self, request: Request, spider):
+    def process_request(self, request: Request):
         if request.meta.get("proxy"):
             return None
         if self._cycle:

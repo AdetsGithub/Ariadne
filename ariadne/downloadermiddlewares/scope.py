@@ -25,7 +25,7 @@ class ScopeMiddleware:
     def from_crawler(cls, crawler):
         return cls(crawler.settings.get("ARIADNE_ENGAGEMENT"))
 
-    def process_request(self, request: Request, spider):
+    def process_request(self, request: Request):
         if request.meta.get("ariadne_skip_scope") or request.meta.get("ariadne_exit_ip_canary"):
             return None
         # If no engagement loaded, allow (unit tests / doctor).
