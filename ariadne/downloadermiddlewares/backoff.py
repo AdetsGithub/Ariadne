@@ -1,4 +1,8 @@
-"""Retry / exponential backoff on 429/503 with Retry-After respect."""
+"""Retry / exponential backoff on 429/503 with Retry-After respect.
+
+Compatible with Scrapy ≥2.13 where ``RetryMiddleware._retry`` takes
+``(request, reason)`` only — the spider is read from ``self.crawler.spider``.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +23,10 @@ class BackoffMiddleware(RetryMiddleware):
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(crawler.settings, crawler)
+        mw = cls(crawler.settings, crawler)
+        # Scrapy 2.13+ RetryMiddleware._retry expects self.crawler set.
+        mw.crawler = crawler
+        return mw
 
     def process_response(self, request, response):
         if request.meta.get("dont_retry", False):
@@ -41,6 +48,5 @@ class BackoffMiddleware(RetryMiddleware):
                 delay = (2**retries) + random.uniform(0, 1)
             request.meta["download_delay"] = delay
             logger.debug("Backoff %ss for %s (%s)", delay, request.url, reason)
-            spider = self.crawler.spider if self.crawler else None
-            return self._retry(request, reason, spider) or response
+            return self._retry(request, reason) or response
         return response
