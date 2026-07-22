@@ -27,10 +27,10 @@ scope:
   # Full authorization: no deny list. Add patterns here only if you later
   # want to exclude specific destructive actions mid-crawl.
   deny_url_regex: []
-  max_depth: 5
-  # observe = inventory Disallow + schedule Disallow fetches per policy
-  # (ARIADNE_ROBOTS_HINT_POLICY=defer|inventory_only|follow; default defer)
-  respect_robots: ignore
+  # Unlimited depth for comprehensive inventory (pair with polite concurrency).
+  max_depth: null
+  # observe = robots + Sitemap: directives; map also probes /sitemap.xml
+  respect_robots: observe
 
 crawl:
   mode: map
@@ -41,14 +41,21 @@ crawl:
     escalate_to:
       - L2_browser
       # - L3_unlocker   # enable only with ARIADNE_UNLOCKER_URL + budget
-    # Omit to use full catalog; Session Sync filters to Playwright TLS anchor
-    # (nearest ≤ major when curl_cffi lags). Prefer modern Chrome profiles:
     impersonate_profiles:
       - chrome146
       - chrome145
       - chrome142
       - chrome136
       - chrome131
+  discovery:
+    sitemaps: true
+    include_assets: true
+    asset_method: head
+    outbound_links: true
+    record_failures: true
+    record_http_errors: true
+    js_route_hints: true
+    form_action_seeds: true
   concurrency:
     max_concurrent_requests: 4
     download_delay_mean: 1.5
