@@ -194,13 +194,18 @@ Python `BrowserPoolExtension` still closes Playwright on `engine_stopped` / sign
 
 | Item | Source |
 | --- | --- |
-| `PageItem` | map / extract |
-| `EndpointItem` | apisnoop / forms / robots / future JS hints |
+| `PageItem` | map / extract / apisnoop |
+| `EndpointItem` | apisnoop network XHR/fetch |
 | `RobotsHintItem` | robots observe |
 | `FormItem` | HTML forms |
+| `AssetItem` | Static assets (`discovery.include_assets`) |
+| `OutboundLinkItem` | Cross-host links (record-only, never fetched) |
+| `FailedUrlItem` | Download / depth / HTTP gaps |
+| `UrlCandidateItem` | Sitemap / JS / form discoveries |
 | `DefenseEventItem` | challenges, L3 lock, transparent IP, etc. |
 
-Pipelines: validate → dedupe → NDJSON export.
+Pipelines: validate → dedupe → NDJSON export.  
+Union inventory: `ariadne report DIR --sitemap` → `sitemap.jsonl` ([SITEMAP.md](./SITEMAP.md)).
 
 ---
 
