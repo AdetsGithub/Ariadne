@@ -1,7 +1,8 @@
-"""Extract spider — map + simple title/heading extraction."""
+"""Extract spider — map discovery + heading / JSON-LD extraction."""
 
 from __future__ import annotations
 
+from ariadne.discovery.html import discovery_settings, extract_js_path_hints, iter_get_form_actions
 from ariadne.spiders.map_spider import MapSpider
 
 
@@ -9,6 +10,12 @@ class ExtractSpider(MapSpider):
     name = "extract"
 
     def parse(self, response):
+        if response.meta.get("ariadne_asset"):
+            yield from self._parse_asset_response(response)
+            return
+        if not self._is_html_response(response):
+            return
+
         extraction = {
             "kind": "extract",
             "h1": response.css("h1::text").getall(),
@@ -16,31 +23,25 @@ class ExtractSpider(MapSpider):
             "json_ld": response.css('script[type="application/ld+json"]::text').getall()[:5],
         }
         item = self.make_page_item(response, extraction=extraction)
+        item["discovery_source"] = response.meta.get("discovery_source") or "link"
         yield item
         yield from self.iter_forms(response)
+        yield from self._discover_from_html(response)
 
-        # Reuse map link discovery
-        depth = response.meta.get("depth", 0)
-        max_depth = ((self._engagement().get("scope") or {}).get("max_depth") or 5)
-        if depth >= max_depth:
-            return
-
-        from urllib.parse import urlparse
-        import scrapy
-
-        for url, suspect in self.iter_safe_links(response):
-            host = urlparse(url).hostname or ""
-            if self.allowed_domains and not any(
-                host == d or host.endswith("." + d) for d in self.allowed_domains
-            ):
-                continue
-            yield scrapy.Request(
-                url,
-                callback=self.parse,
-                meta={
-                    "transport_mode": response.meta.get("transport_mode", "L1_impersonate"),
-                    "depth": depth + 1,
-                    "parent_url": response.url,
-                    "honeypot_suspect": suspect,
-                },
-            )
+        disc = discovery_settings(self)
+        if disc.get("form_action_seeds", True):
+            for action in iter_get_form_actions(response):
+                yield from self._schedule_discovered(
+                    action,
+                    source="form_action",
+                    parent_url=response.url,
+                    schedule=True,
+                )
+        if disc.get("js_route_hints", False):
+            for hint in extract_js_path_hints(response):
+                yield from self._schedule_discovered(
+                    hint,
+                    source="js_hint",
+                    parent_url=response.url,
+                    schedule=True,
+                )

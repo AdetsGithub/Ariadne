@@ -1,11 +1,15 @@
-"""ApiSnoop spider — L2 crawl with network interception (MAX_BODY_SIZE guarded)."""
+"""ApiSnoop spider — L2 crawl with network interception + map discovery.
+
+Uses Playwright for every page and emits EndpointItem from XHR/fetch.
+Also records outbound links / sitemap seeds / failures like map when enabled.
+"""
 
 from __future__ import annotations
 
 from urllib.parse import urlparse
 
-import scrapy
-
+from ariadne.discovery.html import discovery_settings, extract_js_path_hints, iter_get_form_actions
+from ariadne.discovery.sitemaps import default_sitemap_guess
 from ariadne.items import EndpointItem
 from ariadne.spiders.map_spider import MapSpider
 
@@ -21,22 +25,51 @@ class ApiSnoopSpider(MapSpider):
 
     def start_requests(self):
         for url in self.start_urls:
-            yield scrapy.Request(
+            yield self._request(
                 url,
-                callback=self.parse,
-                meta={
-                    "transport_mode": "L2_browser",
-                    "capture_network": True,
-                    "depth": 0,
-                },
+                depth=0,
+                discovery_source="seed",
+                capture_network=True,
             )
+        disc = discovery_settings(self)
+        if disc.get("sitemaps", True):
+            seen: set[str] = set()
+            for url in self.start_urls:
+                p = urlparse(url)
+                origin = f"{p.scheme}://{p.netloc}"
+                if origin in seen:
+                    continue
+                seen.add(origin)
+                yield self._request(
+                    default_sitemap_guess(origin),
+                    callback=self.parse_sitemap,
+                    depth=0,
+                    discovery_source="sitemap",
+                    dont_filter=True,
+                    transport_mode="L1_impersonate",
+                )
+
+    def _transport(self) -> str:
+        return "L2_browser"
 
     def parse(self, response):
-        yield self.make_page_item(
+        if response.meta.get("ariadne_asset"):
+            yield from self._parse_asset_response(response)
+            return
+        if not self._is_html_response(response):
+            return
+
+        endpoints = response.meta.get("ariadne_network_endpoints") or []
+        item = self.make_page_item(
             response,
-            extraction={"kind": "apisnoop", "network_count": len(response.meta.get("ariadne_network_endpoints") or [])},
+            extraction={
+                "kind": "apisnoop",
+                "network_count": len(endpoints),
+            },
         )
-        for ep in response.meta.get("ariadne_network_endpoints") or []:
+        item["discovery_source"] = response.meta.get("discovery_source") or "link"
+        yield item
+        for ep in endpoints:
             yield EndpointItem(
                 url=ep["url"],
                 method=ep.get("method"),
@@ -46,26 +79,22 @@ class ApiSnoopSpider(MapSpider):
                 parameters=ep.get("parameters") or [],
             )
         yield from self.iter_forms(response)
+        yield from self._discover_from_html(response)
 
-        depth = response.meta.get("depth", 0)
-        max_depth = ((self._engagement().get("scope") or {}).get("max_depth") or 5)
-        if depth >= max_depth:
-            return
-
-        for url, suspect in self.iter_safe_links(response):
-            host = urlparse(url).hostname or ""
-            if self.allowed_domains and not any(
-                host == d or host.endswith("." + d) for d in self.allowed_domains
-            ):
-                continue
-            yield scrapy.Request(
-                url,
-                callback=self.parse,
-                meta={
-                    "transport_mode": "L2_browser",
-                    "capture_network": True,
-                    "depth": depth + 1,
-                    "parent_url": response.url,
-                    "honeypot_suspect": suspect,
-                },
-            )
+        disc = discovery_settings(self)
+        if disc.get("form_action_seeds", True):
+            for action in iter_get_form_actions(response):
+                yield from self._schedule_discovered(
+                    action,
+                    source="form_action",
+                    parent_url=response.url,
+                    schedule=True,
+                )
+        if disc.get("js_route_hints", False):
+            for hint in extract_js_path_hints(response):
+                yield from self._schedule_discovered(
+                    hint,
+                    source="js_hint",
+                    parent_url=response.url,
+                    schedule=True,
+                )

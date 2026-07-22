@@ -86,6 +86,7 @@ class ScopeSpider(scrapy.Spider):
             extraction=extraction or {},
             title=self._safe_title(response),
             defense_events=response.meta.get("defense_events"),
+            discovery_source=response.meta.get("discovery_source"),
         )
 
     @staticmethod
