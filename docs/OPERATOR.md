@@ -63,18 +63,21 @@ Full field reference: [CONFIGURATION.md](./CONFIGURATION.md). Example: [`engagem
 
 | Mode / `--spider` | Purpose |
 | --- | --- |
-| `map` (default) | Link discovery, forms, robots hints → `PageItem` / `FormItem` / `RobotsHintItem` |
-| `extract` | Map + simple heading / JSON-LD extraction |
-| `apisnoop` | Enables browser pool + network capture; XHR/fetch → `EndpointItem` (bodies truncated at `MAX_BODY_SIZE`) |
+| `map` (default) | Link discovery, sitemaps, forms, outbound/failure inventory → see [SITEMAP.md](./SITEMAP.md) |
+| `extract` | Map discovery + heading / JSON-LD extraction |
+| `apisnoop` | L2 + network capture; XHR/fetch → `EndpointItem` (bodies truncated at `MAX_BODY_SIZE`) |
 
 ```bash
 ariadne crawl -c engagement.yaml
 ariadne crawl -c engagement.yaml --spider extract
 ariadne crawl -c engagement.yaml --spider apisnoop
+ariadne report ./artifacts/EXAMPLE-001
+ariadne report ./artifacts/EXAMPLE-001 --sitemap   # union → sitemap.jsonl
 ```
 
 Artifacts land under `{output.dir}/{engagement.id}/` (e.g. `./artifacts/EXAMPLE-001/`).
-
+For a best-effort comprehensive URL list, enable `crawl.discovery` (defaults are on for
+sitemaps/outbound/failures) and run `ariadne report … --sitemap`.
 ---
 
 ## 5. Transport & escalation (operator view)
@@ -153,6 +156,11 @@ Typical files under `artifacts/{id}/`:
 | `EndpointItem.ndjson` | APIs (apisnoop) |
 | `RobotsHintItem.ndjson` | Disallow/Allow inventory |
 | `FormItem.ndjson` | Forms |
+| `AssetItem.ndjson` | Static assets (when `discovery.include_assets`) |
+| `OutboundLinkItem.ndjson` | Cross-host links (recorded, not fetched) |
+| `FailedUrlItem.ndjson` | Download / depth / HTTP gaps |
+| `UrlCandidateItem.ndjson` | Sitemap / JS / form discoveries |
+| `sitemap.jsonl` / `sitemap.md` | Union inventory from `ariadne report --sitemap` |
 | `engagement.json` | Engagement snapshot |
 | `screenshots/` | Conditional (challenge/error) |
 | `summary.md` | From `ariadne report` |

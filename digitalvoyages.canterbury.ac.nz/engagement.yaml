@@ -1,0 +1,89 @@
+# Extended engagement — digitalvoyages.canterbury.ac.nz
+# Operator-authorized comprehensive scan (full scope per engagement ROE).
+#
+# Validate:
+#   ariadne validate digitalvoyages.canterbury.ac.nz/engagement.yaml
+#
+# Suggested sequence:
+#   ariadne doctor --leak-check
+#   ariadne crawl -c digitalvoyages.canterbury.ac.nz/engagement.yaml --spider map
+#   ariadne crawl -c digitalvoyages.canterbury.ac.nz/engagement.yaml --spider extract
+#   ariadne crawl -c digitalvoyages.canterbury.ac.nz/engagement.yaml --spider apisnoop
+#   ariadne report digitalvoyages.canterbury.ac.nz/comprehensive --sitemap
+#
+# Discovery / sitemap docs: docs/SITEMAP.md | docs/CONFIGURATION.md | docs/OPERATOR.md
+
+engagement:
+  id: "comprehensive"
+  client: "University of Canterbury — Digital Voyages"
+  operator: "local-operator"
+  authorized_until: "2099-12-31T23:59:59Z"
+
+scope:
+  allow_domains:
+    - "digitalvoyages.canterbury.ac.nz"
+  allow_url_regex:
+    - "^https://digitalvoyages\\.canterbury\\.ac\\.nz/.*"
+  # Full authorization: no deny list. Add patterns here only if you later
+  # want to exclude specific destructive actions mid-crawl.
+  deny_url_regex: []
+  max_depth: 5
+  # observe = inventory Disallow + schedule Disallow fetches per policy
+  # (ARIADNE_ROBOTS_HINT_POLICY=defer|inventory_only|follow; default defer)
+  respect_robots: ignore
+
+crawl:
+  mode: map
+  start_urls:
+    - "https://digitalvoyages.canterbury.ac.nz/"
+  transport:
+    initial_mode: L1_impersonate
+    escalate_to:
+      - L2_browser
+      # - L3_unlocker   # enable only with ARIADNE_UNLOCKER_URL + budget
+    # Omit to use full catalog; Session Sync filters to Playwright TLS anchor
+    # (nearest ≤ major when curl_cffi lags). Prefer modern Chrome profiles:
+    impersonate_profiles:
+      - chrome146
+      - chrome145
+      - chrome142
+      - chrome136
+      - chrome131
+  concurrency:
+    max_concurrent_requests: 4
+    download_delay_mean: 1.5
+    download_delay_std: 0.5
+  session:
+    challenge_lease_ttl_seconds: 120
+    clearance_wait_delay_mean: 2.0
+    escalation_priority: 100
+  browser:
+    headless: true
+    pool_size: 4
+    checkout_timeout_seconds: 60
+    execution_timeout_seconds: 180
+    max_contexts_served: 5000
+    disable_webrtc: true
+    proxy_dns: true
+    humanize: true
+    # map/extract: pool still on because escalate_to includes L2.
+    # Set true (or use --spider apisnoop) for XHR/fetch EndpointItems.
+    capture_network: false
+  honeypot:
+    l1_unverified: defer
+  proxies:
+    class: residential
+    sticky_ttl_seconds: 600
+    # Sticky residential URLs, e.g.:
+    # - "http://user-session-SESSIONID:pass@proxy.example:8000"
+    # - "socks5h://user:pass@proxy.example:1080"
+    urls: []
+
+output:
+  # Artifacts → digitalvoyages.canterbury.ac.nz/comprehensive/
+  dir: "./digitalvoyages.canterbury.ac.nz"
+  formats: [ndjson, markdown_summary]
+  capture:
+    screenshots: on_challenge_or_error
+    har: on_apisnoop_or_challenge
+  redact_pii: true

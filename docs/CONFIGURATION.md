@@ -33,11 +33,10 @@ output: { … }          # optional; defaults apply
 | `allow_domains` | list[str] | `[]` | Host allowlist |
 | `allow_url_regex` | list[str] | `[]` | URL allow patterns (all must allow if set) |
 | `deny_url_regex` | list[str] | `[]` | Hard deny |
-| `max_depth` | int | `5` | Link depth from seeds |
+| `max_depth` | int \| null | `5` | Link depth from seeds; `null` / `-1` / `unlimited` = no cap |
 | `respect_robots` | `observe` \| `obey` \| `ignore` | `observe` | Robots policy |
 
 ### `crawl`
-
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `mode` | `map` \| `extract` \| `apisnoop` \| … | `map` | Default spider when `--spider` omitted |
@@ -48,6 +47,23 @@ output: { … }          # optional; defaults apply
 | `browser` | object | see below | Playwright pool |
 | `honeypot` | object | `l1_unverified: defer` | Unverified link policy |
 | `proxies` | object | see below | Sticky proxy list |
+| `discovery` | object | see below | Comprehensive sitemap inventory knobs |
+
+#### `crawl.discovery`
+
+Best-effort URL inventory beyond HTML link-follows. Cross-host links are **never fetched**.
+Full semantics: [SITEMAP.md](./SITEMAP.md).
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `sitemaps` | `true` | Parse `/sitemap.xml` and robots `Sitemap:` → depth-0 seeds |
+| `include_assets` | `false` | Emit `AssetItem` for images/css/js/pdf/… |
+| `asset_method` | `head` | `head` \| `get` \| `none` (URL-only) |
+| `outbound_links` | `true` | Record off-host `<a href>` as `OutboundLinkItem` |
+| `record_failures` | `true` | `FailedUrlItem` on download errors / max_depth skips |
+| `record_http_errors` | `true` | Keep 4xx/5xx as `PageItem` via `handle_httpstatus_list` |
+| `js_route_hints` | `false` | Heuristic path strings from inline scripts |
+| `form_action_seeds` | `true` | Schedule in-scope GET form actions at depth 0 |
 
 #### `crawl.transport`
 

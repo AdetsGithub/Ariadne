@@ -134,12 +134,33 @@ def crawl(
 
 
 @app.command()
-def report(artifacts: Path = typer.Argument(..., exists=True, file_okay=False)) -> None:
+def report(
+    artifacts: Path = typer.Argument(..., exists=True, file_okay=False),
+    sitemap: bool = typer.Option(
+        False,
+        "--sitemap",
+        help="Also write sitemap.jsonl + sitemap.md (union of discovery artifacts)",
+    ),
+) -> None:
     """Emit a short Markdown summary from NDJSON artifacts."""
     pages = artifacts / "PageItem.ndjson"
     robots = artifacts / "RobotsHintItem.ndjson"
-    n_pages = sum(1 for _ in pages.open()) if pages.exists() else 0
-    n_robots = sum(1 for _ in robots.open()) if robots.exists() else 0
+    forms = artifacts / "FormItem.ndjson"
+    failed = artifacts / "FailedUrlItem.ndjson"
+    outbound = artifacts / "OutboundLinkItem.ndjson"
+    assets = artifacts / "AssetItem.ndjson"
+    candidates = artifacts / "UrlCandidateItem.ndjson"
+
+    def _count(p: Path) -> int:
+        return sum(1 for _ in p.open()) if p.exists() else 0
+
+    n_pages = _count(pages)
+    n_robots = _count(robots)
+    n_forms = _count(forms)
+    n_failed = _count(failed)
+    n_outbound = _count(outbound)
+    n_assets = _count(assets)
+    n_candidates = _count(candidates)
     eng = {}
     eng_path = artifacts / "engagement.json"
     if eng_path.exists():
@@ -150,7 +171,12 @@ def report(artifacts: Path = typer.Argument(..., exists=True, file_okay=False)) 
 - Engagement: `{meta.get('id', artifacts.name)}`
 - Client: {meta.get('client', 'n/a')}
 - Pages: {n_pages}
+- Forms: {n_forms}
 - Robots hints: {n_robots}
+- Assets: {n_assets}
+- URL candidates: {n_candidates}
+- Failed URLs: {n_failed}
+- Outbound links: {n_outbound}
 
 Artifacts: `{artifacts}`
 """
@@ -158,6 +184,13 @@ Artifacts: `{artifacts}`
     out.write_text(md, encoding="utf-8")
     typer.echo(md)
     typer.echo(f"Wrote {out}")
+
+    if sitemap:
+        from ariadne.reporting.sitemap import write_sitemap_report
+
+        jsonl, sm_md, counts = write_sitemap_report(artifacts)
+        typer.echo(f"Sitemap union: {sum(counts.values())} unique URLs → {jsonl}")
+        typer.echo(f"Wrote {sm_md}")
 
 
 @app.command()

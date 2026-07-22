@@ -26,6 +26,7 @@ scope:
   # observe = inventory Disallow + defer fetches (default)
   # obey    = skip Disallow
   # ignore  = do not fetch robots.txt
+  # Use null / -1 for unlimited depth (pair with polite concurrency).
   respect_robots: observe
 
 crawl:
@@ -39,6 +40,16 @@ crawl:
       # - L3_unlocker   # enable only with ARIADNE_UNLOCKER_URL + budget
 # When L2 is on, profiles are filtered to Playwright Chromium major.
 # Omit impersonate_profiles (or leave unset) to use the full catalog.
+  discovery:
+    # Best-effort comprehensive inventory — see docs/SITEMAP.md
+    sitemaps: true
+    include_assets: false
+    asset_method: head
+    outbound_links: true      # record cross-host; never fetch
+    record_failures: true
+    record_http_errors: true
+    js_route_hints: false
+    form_action_seeds: true
   concurrency:
     max_concurrent_requests: 8
     download_delay_mean: 2.0
