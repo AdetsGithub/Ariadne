@@ -19,7 +19,12 @@ class ScopeMiddleware:
         self.allow_domains = set(scope.get("allow_domains") or [])
         self.allow_re = [re.compile(p) for p in (scope.get("allow_url_regex") or [])]
         self.deny_re = [re.compile(p) for p in (scope.get("deny_url_regex") or [])]
-        self.max_depth = int(scope.get("max_depth") or 5)
+        raw_depth = scope.get("max_depth", 5)
+        # None / negative ⇒ unlimited (comprehensive sitemap engagements).
+        if raw_depth is None or (isinstance(raw_depth, int) and raw_depth < 0):
+            self.max_depth: int | None = None
+        else:
+            self.max_depth = int(raw_depth)
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -34,7 +39,7 @@ class ScopeMiddleware:
         url = request.url
         host = urlparse(url).hostname or ""
         depth = request.meta.get("depth", 0)
-        if depth > self.max_depth:
+        if self.max_depth is not None and depth > self.max_depth:
             raise IgnoreRequest(f"max_depth exceeded for {url}")
         if self.deny_re and any(p.search(url) for p in self.deny_re):
             raise IgnoreRequest(f"deny_url_regex matched {url}")

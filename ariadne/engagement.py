@@ -21,8 +21,21 @@ class ScopeConfig(BaseModel):
     allow_domains: list[str] = Field(default_factory=list)
     allow_url_regex: list[str] = Field(default_factory=list)
     deny_url_regex: list[str] = Field(default_factory=list)
-    max_depth: int = 5
+    # null / -1 = unlimited link depth (sitemap seeds still use depth 0).
+    max_depth: int | None = 5
     respect_robots: Literal["observe", "obey", "ignore"] = "observe"
+
+    @field_validator("max_depth", mode="before")
+    @classmethod
+    def _max_depth_normalize(cls, v: Any) -> int | None:
+        if v is None or v == "unlimited":
+            return None
+        if isinstance(v, str) and v.strip().lower() in {"", "null", "none", "unlimited"}:
+            return None
+        n = int(v)
+        if n < 0:
+            return None
+        return n
 
 
 class TransportConfig(BaseModel):
@@ -62,6 +75,23 @@ class HoneypotConfig(BaseModel):
     l1_unverified: Literal["defer", "risk_score", "follow"] = "defer"
 
 
+class DiscoveryConfig(BaseModel):
+    """Best-effort comprehensive URL inventory knobs for map / extract / apisnoop.
+
+    Cross-host links are always record-only (OutboundLinkItem) — never fetched.
+    See docs/SITEMAP.md for artifact semantics and residual SPA gaps.
+    """
+
+    sitemaps: bool = True
+    include_assets: bool = False
+    asset_method: Literal["head", "get", "none"] = "head"
+    outbound_links: bool = True
+    record_failures: bool = True
+    record_http_errors: bool = True
+    js_route_hints: bool = False
+    form_action_seeds: bool = True
+
+
 class ProxiesConfig(BaseModel):
     class_: Literal["datacenter", "residential", "mobile"] = Field(
         default="residential", alias="class"
@@ -93,6 +123,7 @@ class CrawlConfig(BaseModel):
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     honeypot: HoneypotConfig = Field(default_factory=HoneypotConfig)
     proxies: ProxiesConfig = Field(default_factory=ProxiesConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
 
 class EngagementConfig(BaseModel):
@@ -151,4 +182,6 @@ def engagement_to_scrapy_settings(cfg: EngagementConfig) -> dict[str, Any]:
         "ARIADNE_BROWSER_HEADLESS": cfg.crawl.browser.headless,
         "ARIADNE_CAPTURE_NETWORK": mode == "apisnoop" or cfg.crawl.browser.capture_network,
         "ARIADNE_SCREENSHOT_MODE": cfg.output.capture.screenshots,
+        "ARIADNE_DISCOVERY": cfg.crawl.discovery.model_dump(mode="json"),
+        "ARIADNE_MAX_DEPTH": cfg.scope.max_depth,
     }
