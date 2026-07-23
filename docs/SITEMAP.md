@@ -17,6 +17,9 @@ and emit a union inventory via `ariadne report --sitemap`.
 | GET form actions | `UrlCandidateItem` + seed | Yes (in-scope) |
 | Browser XHR (apisnoop) | `EndpointItem` | Via L2 |
 
+`EndpointItem` from apisnoop includes `status`, `body_truncated`, and optional
+`sample_body` (≤500 chars when the body was captured under `MAX_BODY_SIZE`).
+
 **Residual gaps (not claimed):** opaque SPA client routers, auth-only trees, search
 query-parameter explosion, URLs never linked and absent from sitemaps.
 

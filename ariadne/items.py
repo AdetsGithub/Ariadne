@@ -38,6 +38,9 @@ class EndpointItem(scrapy.Item):
     auth_required = scrapy.Field()
     content_type = scrapy.Field()
     parameters = scrapy.Field()
+    status = scrapy.Field()
+    body_truncated = scrapy.Field()
+    sample_body = scrapy.Field()
 
 
 class RobotsHintItem(scrapy.Item):

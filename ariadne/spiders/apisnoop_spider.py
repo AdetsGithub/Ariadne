@@ -77,6 +77,9 @@ class ApiSnoopSpider(MapSpider):
                 auth_required=None,
                 content_type=ep.get("content_type"),
                 parameters=ep.get("parameters") or [],
+                status=ep.get("status"),
+                body_truncated=ep.get("body_truncated", False),
+                sample_body=ep.get("sample_body"),
             )
         yield from self.iter_forms(response)
         yield from self._discover_from_html(response)
