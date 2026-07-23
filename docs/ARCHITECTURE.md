@@ -45,7 +45,7 @@ L2 handler → pool.checkout → solve → set cookies → release_challenge(sol
 siblings → stagger if clearance fresh → L1 resume
 ```
 
-Never await the browser pool inside L1 middleware.
+Pool saturation on genuine L2 traffic: L2 download handler uses **queue** checkout timeout; on timeout, `PoolTimeoutRequeueMiddleware` re-schedules the L2 request with **high priority** + backoff delay (again freeing the slot) rather than waiting unbounded. CAPTCHA/solve work after acquire is bounded by **execution** timeout (§5.2.1), not the queue timeout.
 
 ---
 
@@ -95,6 +95,7 @@ L3 success → `lock_to_mode(L3)`. Leaving L3 requires `burn_session`, not cooki
 | 350 | `ProxyMiddleware` | Attach proxy |
 | 550 | `BackoffMiddleware` | 429 / Retry-After |
 | 585 | `ChallengeDetectMiddleware` | Detect → re-schedule escalate; transparent IP |
+| 590 | `PoolTimeoutRequeueMiddleware` | L2 pool checkout/execution timeout → high-priority requeue |
 
 ### Spider
 

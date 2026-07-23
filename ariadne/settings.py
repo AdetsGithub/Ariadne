@@ -29,6 +29,7 @@ DOWNLOADER_MIDDLEWARES = {
     "ariadne.downloadermiddlewares.proxy.ProxyMiddleware": 350,
     "ariadne.downloadermiddlewares.backoff.BackoffMiddleware": 550,
     "ariadne.downloadermiddlewares.challenge.ChallengeDetectMiddleware": 585,
+    "ariadne.downloadermiddlewares.pool_timeout.PoolTimeoutRequeueMiddleware": 590,
     "scrapy.downloadermiddlewares.retry.RetryMiddleware": None,
 }
 
@@ -101,7 +102,9 @@ ARIADNE_CIRCUIT_L3_WINDOW = 10
 ARIADNE_CIRCUIT_L3_EMPTY_RATIO = 0.40
 ARIADNE_CIRCUIT_L3_MIN_SAMPLES = 5
 
-# Transparent sticky exit-IP rotation
+# L2 pool timeout requeue (checkout vs execution — SPEC §5.2.1)
+ARIADNE_L2_REQUEUE_MAX = 3
+ARIADNE_L2_REQUEUE_DELAY = 2.0
 ARIADNE_TRANSPARENT_IP_WINDOW = 60.0
 ARIADNE_TRANSPARENT_IP_MAX_BURNS = 3
 ARIADNE_EXIT_IP_CANARY = False  # active echo check (Phase 4 optional)

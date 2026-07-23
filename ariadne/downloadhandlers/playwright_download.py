@@ -149,13 +149,19 @@ async def download_with_playwright(request: Request, settings) -> Response:
 
     try:
         return await asyncio.wait_for(_run(), timeout=exec_timeout)
-    except TimeoutError:
+    except TimeoutError as exc:
+        msg = str(exc).lower()
+        if "checkout queue timeout" in msg:
+            request.meta["ariadne_pool_timeout"] = "checkout"
+        else:
+            request.meta.setdefault("ariadne_pool_timeout", "execution")
+        request.meta["ariadne_requeue_l2"] = True
         if sess.challenge_state == ChallengeState.SOLVING:
             sync.release_challenge(sid, ChallengeState.FAILED)
         raise
     except asyncio.TimeoutError:
         if sess.challenge_state == ChallengeState.SOLVING:
             sync.release_challenge(sid, ChallengeState.FAILED)
-        # Re-schedule signal via meta for middleware/handler
         request.meta["ariadne_pool_timeout"] = "execution"
-        raise TimeoutError(f"L2 execution timeout after {exec_timeout}s for {request.url}")
+        request.meta["ariadne_requeue_l2"] = True
+        raise TimeoutError(f"L2 execution timeout after {exec_timeout}s for {request.url}") from None
