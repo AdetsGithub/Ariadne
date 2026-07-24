@@ -91,6 +91,7 @@ ARIADNE_BROWSER_HUMANIZE = True
 ARIADNE_CAPTURE_NETWORK = False
 ARIADNE_MAX_BODY_SIZE = 2097152  # 2 MiB — apisnoop OOM guard
 ARIADNE_SCREENSHOT_MODE = "on_challenge_or_error"
+ARIADNE_HAR_MODE = "on_apisnoop_or_challenge"
 
 # Phase 3 — L3 unlocker, CAPTCHA, circuit breaker
 ARIADNE_UNLOCKER_URL = None  # template; also read from env ARIADNE_UNLOCKER_URL

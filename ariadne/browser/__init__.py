@@ -155,6 +155,7 @@ class BrowserPool:
         proxy: str | None = None,
         storage_state: dict[str, Any] | None = None,
         cookies: dict[str, str] | None = None,
+        record_har_path: str | None = None,
     ) -> AsyncIterator[Any]:
         """Acquire a context (queue timeout) then yield it (caller bound by execution_timeout)."""
         if self._semaphore is None or self._closed:
@@ -185,6 +186,10 @@ class BrowserPool:
             if proxy:
                 # Playwright proxy; DNS via proxy depends on proxy type (socks5h preferred).
                 context_kwargs["proxy"] = {"server": proxy}
+            if record_har_path:
+                context_kwargs["record_har_path"] = record_har_path
+                context_kwargs["record_har_mode"] = "minimal"
+                context_kwargs["record_har_content"] = "omit"
 
             context = await bp.browser.new_context(**context_kwargs)
             await context.add_init_script(STEALTH_INIT_SCRIPT)

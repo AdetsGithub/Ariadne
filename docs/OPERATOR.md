@@ -65,7 +65,7 @@ Full field reference: [CONFIGURATION.md](./CONFIGURATION.md). Example: [`engagem
 | --- | --- |
 | `map` (default) | Link discovery, sitemaps, forms, outbound/failure inventory → see [SITEMAP.md](./SITEMAP.md) |
 | `extract` | Map discovery + heading / JSON-LD extraction |
-| `apisnoop` | L2 + network capture; XHR/fetch → `EndpointItem` (bodies truncated at `MAX_BODY_SIZE`) |
+| `apisnoop` | L2 + network capture; XHR/fetch → `EndpointItem` (bodies truncated at `MAX_BODY_SIZE`); HAR files under `har/` when `capture.har` allows |
 
 ```bash
 ariadne crawl -c engagement.yaml

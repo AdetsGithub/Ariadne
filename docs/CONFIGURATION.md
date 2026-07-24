@@ -133,7 +133,7 @@ Browser pool auto-enables for `apisnoop`, `auth`, `initial_mode` L2*, or `captur
 | `formats` | `[ndjson, markdown_summary]` | Exporters |
 | `redact_pii` | `true` | Pipeline flag |
 | `capture.screenshots` | `on_challenge_or_error` | `never` \| `on_challenge_or_error` \| `always` |
-| `capture.har` | `on_apisnoop_or_challenge` | Conditional HAR policy |
+| `capture.har` | `on_apisnoop_or_challenge` | Playwright HAR under `{output}/har/` when apisnoop or `always` |
 
 ### Complete example
 

@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from scrapy.http import Headers, HtmlResponse, Request, Response
 
 from ariadne.browser import get_browser_pool
+from ariadne.browser.har import build_har_path, har_capture_enabled
 from ariadne.browser.network import DEFAULT_MAX_BODY_SIZE, attach_network_sniffer, endpoints_from_bucket
 from ariadne.session import ChallengeState, get_session_sync
 
@@ -32,6 +33,10 @@ async def download_with_playwright(request: Request, settings) -> Response:
     exec_timeout = settings.getfloat("ARIADNE_BROWSER_EXECUTION_TIMEOUT", pool.execution_timeout)
 
     network_bucket: list[dict[str, Any]] = []
+    har_path: str | None = None
+    if har_capture_enabled(settings):
+        out_dir = settings.get("ARIADNE_OUTPUT_DIR", "artifacts")
+        har_path = str(build_har_path(out_dir, sid, request.url))
 
     async def _run() -> Response:
         async with pool.checkout(
@@ -40,6 +45,7 @@ async def download_with_playwright(request: Request, settings) -> Response:
             proxy=proxy,
             storage_state=storage,
             cookies=cookies if not storage else None,
+            record_har_path=har_path,
         ) as context:
             # Prefer storage_state; else add cookies with correct domain
             if cookies and not storage:
@@ -104,6 +110,8 @@ async def download_with_playwright(request: Request, settings) -> Response:
 
             request.meta["ariadne_response_cookies"] = cookie_map
             request.meta["transport_mode_used"] = "L2_browser"
+            if har_path:
+                request.meta["har_path"] = har_path
             if state:
                 sync.set_storage_state(sess, state)
             if cookie_map:

@@ -29,6 +29,8 @@ class PageItem(scrapy.Item):
     defense_events = scrapy.Field()
     # Optional: sitemap | link | form_action | js_hint | …
     discovery_source = scrapy.Field()
+    screenshot_path = scrapy.Field()
+    har_path = scrapy.Field()
 
 
 class EndpointItem(scrapy.Item):

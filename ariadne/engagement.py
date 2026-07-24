@@ -246,6 +246,7 @@ def engagement_to_scrapy_settings(
         "ARIADNE_BROWSER_HEADLESS": cfg.crawl.browser.headless,
         "ARIADNE_CAPTURE_NETWORK": mode == "apisnoop" or cfg.crawl.browser.capture_network,
         "ARIADNE_SCREENSHOT_MODE": cfg.output.capture.screenshots,
+        "ARIADNE_HAR_MODE": cfg.output.capture.har,
         "ARIADNE_DISCOVERY": cfg.crawl.discovery.model_dump(mode="json"),
         "ARIADNE_MAX_DEPTH": cfg.scope.max_depth,
     }
