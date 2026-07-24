@@ -77,9 +77,14 @@ Full semantics: [SITEMAP.md](./SITEMAP.md).
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `max_concurrent_requests` | `8` | → `CONCURRENT_REQUESTS` |
+| `max_concurrent_requests` | `8` | → `CONCURRENT_REQUESTS` (hard ceiling **16** without `--force-unsafe`) |
+| `max_concurrent_per_domain` | `4` | → `CONCURRENT_REQUESTS_PER_DOMAIN` (hard ceiling **8**) |
+| `max_rps_per_host` | `2.0` | Per-host RPS via `RateCeilingMiddleware` (hard ceiling **5.0**) |
 | `download_delay_mean` | `3.5` | → `DOWNLOAD_DELAY` |
 | `download_delay_std` | `1.2` | Reserved for jitter helpers |
+
+Exceeding hard ceilings requires `ariadne crawl --force-unsafe`, which appends a line to
+`force_unsafe_audit.jsonl` under the engagement output directory.
 
 #### `crawl.session`
 

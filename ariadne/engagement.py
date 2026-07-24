@@ -48,8 +48,62 @@ class TransportConfig(BaseModel):
 
 class ConcurrencyConfig(BaseModel):
     max_concurrent_requests: int = 8
+    max_concurrent_per_domain: int = 4
+    max_rps_per_host: float = 2.0
     download_delay_mean: float = 3.5
     download_delay_std: float = 1.2
+
+
+# Hard product ceilings — exceed only with CLI --force-unsafe (SPEC §2.3).
+RATE_HARD_CEILINGS: dict[str, float | int] = {
+    "max_concurrent_requests": 16,
+    "max_concurrent_per_domain": 8,
+    "max_rps_per_host": 5.0,
+}
+
+
+def resolve_rate_ceilings(
+    concurrency: ConcurrencyConfig, *, force_unsafe: bool = False
+) -> tuple[dict[str, float | int], dict[str, Any] | None]:
+    """Apply hard rate ceilings unless force_unsafe; return applied limits + audit metadata."""
+    requested = {
+        "max_concurrent_requests": concurrency.max_concurrent_requests,
+        "max_concurrent_per_domain": concurrency.max_concurrent_per_domain,
+        "max_rps_per_host": concurrency.max_rps_per_host,
+    }
+    if force_unsafe:
+        exceeds = {
+            k: v for k, v in requested.items() if v > RATE_HARD_CEILINGS[k]  # type: ignore[operator]
+        }
+        audit: dict[str, Any] = {
+            "requested": requested,
+            "applied": dict(requested),
+            "hard_ceilings": dict(RATE_HARD_CEILINGS),
+            "force_unsafe": True,
+        }
+        if exceeds:
+            audit["exceeds_ceilings"] = exceeds
+        return dict(requested), audit
+
+    applied: dict[str, float | int] = {}
+    clamped: dict[str, dict[str, float | int]] = {}
+    for key, ceiling in RATE_HARD_CEILINGS.items():
+        val = requested[key]
+        if val > ceiling:  # type: ignore[operator]
+            applied[key] = ceiling  # type: ignore[assignment]
+            clamped[key] = {"requested": val, "ceiling": ceiling}  # type: ignore[dict-item]
+        else:
+            applied[key] = val
+    audit = None
+    if clamped:
+        audit = {
+            "requested": requested,
+            "applied": applied,
+            "hard_ceilings": dict(RATE_HARD_CEILINGS),
+            "clamped": clamped,
+            "force_unsafe": False,
+        }
+    return applied, audit
 
 
 class SessionConfig(BaseModel):
@@ -147,7 +201,9 @@ def load_engagement(path: str | Path) -> EngagementConfig:
     return EngagementConfig.model_validate(data)
 
 
-def engagement_to_scrapy_settings(cfg: EngagementConfig) -> dict[str, Any]:
+def engagement_to_scrapy_settings(
+    cfg: EngagementConfig, *, force_unsafe: bool = False
+) -> dict[str, Any]:
     """Map engagement YAML into Scrapy/Ariadne settings overrides."""
     out_dir = Path(cfg.output.dir) / cfg.engagement.id
     mode = cfg.crawl.mode
@@ -161,6 +217,10 @@ def engagement_to_scrapy_settings(cfg: EngagementConfig) -> dict[str, Any]:
         or cfg.crawl.browser.capture_network
     )
 
+    rate_applied, rate_audit = resolve_rate_ceilings(
+        cfg.crawl.concurrency, force_unsafe=force_unsafe
+    )
+
     return {
         "ARIADNE_ENGAGEMENT": cfg.model_dump(mode="json", by_alias=True),
         "ARIADNE_OUTPUT_DIR": str(out_dir),
@@ -172,7 +232,11 @@ def engagement_to_scrapy_settings(cfg: EngagementConfig) -> dict[str, Any]:
         "ARIADNE_CLEARANCE_WAIT_DELAY": cfg.crawl.session.clearance_wait_delay_mean,
         "ARIADNE_IMPERSONATE_PROFILES": cfg.crawl.transport.impersonate_profiles,
         "ARIADNE_PROXY_LIST": cfg.crawl.proxies.urls or None,
-        "CONCURRENT_REQUESTS": cfg.crawl.concurrency.max_concurrent_requests,
+        "CONCURRENT_REQUESTS": int(rate_applied["max_concurrent_requests"]),
+        "CONCURRENT_REQUESTS_PER_DOMAIN": int(rate_applied["max_concurrent_per_domain"]),
+        "ARIADNE_MAX_RPS_PER_HOST": float(rate_applied["max_rps_per_host"]),
+        "ARIADNE_FORCE_UNSAFE": force_unsafe,
+        "ARIADNE_RATE_CEILING_AUDIT": rate_audit,
         "DOWNLOAD_DELAY": cfg.crawl.concurrency.download_delay_mean,
         "ARIADNE_BROWSER_POOL_ENABLED": enable_browser,
         "ARIADNE_BROWSER_POOL_SIZE": cfg.crawl.browser.pool_size,

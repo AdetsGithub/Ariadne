@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -110,12 +111,28 @@ def crawl(
     spider: Optional[str] = typer.Option(
         None, "--spider", help="map|extract|apisnoop (default from YAML mode)"
     ),
+    force_unsafe: bool = typer.Option(
+        False,
+        "--force-unsafe",
+        help="Allow rate limits above hard product ceilings (audit logged)",
+    ),
 ) -> None:
     """Run a crawl from an engagement YAML."""
     cfg = load_engagement(config)
     mode_map = {"map": "map", "extract": "extract", "apisnoop": "apisnoop", "auth": "map", "passive": "map"}
     mode = spider or mode_map.get(cfg.crawl.mode, "map")
-    settings_overrides = engagement_to_scrapy_settings(cfg)
+    settings_overrides = engagement_to_scrapy_settings(cfg, force_unsafe=force_unsafe)
+
+    rate_audit = settings_overrides.pop("ARIADNE_RATE_CEILING_AUDIT", None)
+    if rate_audit:
+        if rate_audit.get("clamped"):
+            typer.echo(
+                f"WARNING: rate ceilings clamped to product limits: {rate_audit['clamped']}",
+                err=True,
+            )
+        if force_unsafe:
+            out_dir = Path(settings_overrides["ARIADNE_OUTPUT_DIR"])
+            _append_force_unsafe_audit(out_dir, cfg, rate_audit)
 
     from scrapy.crawler import CrawlerProcess
     from scrapy.utils.project import get_project_settings
@@ -215,6 +232,21 @@ def pack(
         typer.echo(f"pack failed: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(f"Wrote {result}")
+
+
+def _append_force_unsafe_audit(out_dir: Path, cfg, audit: dict) -> None:
+    """Append one JSON line when --force-unsafe is used (SPEC §2.3)."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "engagement_id": cfg.engagement.id,
+        "operator": cfg.engagement.operator,
+        **audit,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "force_unsafe_audit.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, default=str) + "\n")
+    typer.echo(f"force-unsafe audit: {path}", err=True)
 
 
 _DEFAULT_ENGAGEMENT = """engagement:

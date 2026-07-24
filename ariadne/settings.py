@@ -24,6 +24,7 @@ DEFAULT_REQUEST_HEADERS = {
 DOWNLOADER_MIDDLEWARES = {
     "ariadne.downloadermiddlewares.circuit_breaker.CircuitBreakerMiddleware": 40,
     "ariadne.downloadermiddlewares.scope.ScopeMiddleware": 50,
+    "ariadne.downloadermiddlewares.rate_ceiling.RateCeilingMiddleware": 55,
     "ariadne.downloadermiddlewares.session_sync.SessionSyncMiddleware": 75,
     "ariadne.downloadermiddlewares.persona.PersonaHeadersMiddleware": 100,
     "ariadne.downloadermiddlewares.proxy.ProxyMiddleware": 350,
@@ -105,7 +106,12 @@ ARIADNE_CIRCUIT_L3_MIN_SAMPLES = 5
 # L2 pool timeout requeue (checkout vs execution — SPEC §5.2.1)
 ARIADNE_L2_REQUEUE_MAX = 3
 ARIADNE_L2_REQUEUE_DELAY = 2.0
-ARIADNE_TRANSPARENT_IP_WINDOW = 60.0
+
+# Rate ceilings (SPEC §2.3)
+ARIADNE_MAX_RPS_PER_HOST = 2.0
+ARIADNE_FORCE_UNSAFE = False
+
+# Transparent sticky exit-IP rotation
 ARIADNE_TRANSPARENT_IP_MAX_BURNS = 3
 ARIADNE_EXIT_IP_CANARY = False  # active echo check (Phase 4 optional)
 

@@ -204,6 +204,13 @@ Entrypoint:
 5. Enable L3 only with unlocker budget + extract rules already validated.  
 6. `report` → `pack --encrypt` → deliver.
 
+### Rate ceilings and `--force-unsafe`
+
+Engagement YAML concurrency is clamped to product hard ceilings (16 global / 8 per-domain / 5 RPS)
+unless you pass **`ariadne crawl -c engagement.yaml --force-unsafe`**. That flag logs an audit line
+to `{output}/force_unsafe_audit.jsonl` and should be used only when the ROE explicitly allows
+higher crawl pressure.
+
 ---
 
 ## 12. What Ariadne will not do

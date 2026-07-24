@@ -90,6 +90,7 @@ L3 success → `lock_to_mode(L3)`. Leaving L3 requires `burn_session`, not cooki
 | --- | --- | --- |
 | 40 | `CircuitBreakerMiddleware` | L3 trip → `IgnoreRequest` before wire |
 | 50 | `ScopeMiddleware` | Allow/deny domains & regex; canary skip |
+| 55 | `RateCeilingMiddleware` | Per-host RPS ceiling |
 | 75 | `SessionSyncMiddleware` | Persona, cookies, lock, stagger |
 | 100 | `PersonaHeadersMiddleware` | Header overlay (skipped for canary) |
 | 350 | `ProxyMiddleware` | Attach proxy |
