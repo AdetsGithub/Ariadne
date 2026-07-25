@@ -118,7 +118,7 @@ The entrypoint wraps the process under **Xvfb**, traps EXIT/INT/TERM, and reaps 
 | --- | --- |
 | `ariadne version` | Package version |
 | `ariadne doctor` | Reactor, profiles, curl_cffi, Playwright Chromium TLS anchor |
-| `ariadne doctor --leak-check` | WebRTC launch-arg / DNS-via-proxy guidance |
+| `ariadne doctor --leak-check` | WebRTC launch args; live exit-IP/ICE probe with `--proxy` + `ARIADNE_LEAK_ECHO_URL` |
 | `ariadne init [path]` | Starter engagement YAML |
 | `ariadne validate PATH` | Validate engagement schema |
 | `ariadne crawl -c PATH [--spider map\|extract\|apisnoop]` | Run crawl |

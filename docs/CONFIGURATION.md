@@ -145,7 +145,8 @@ See [`engagements/example.yaml`](../engagements/example.yaml).
 
 | Variable | Purpose |
 | --- | --- |
-| `ARIADNE_UNLOCKER_URL` | L3 unlocker template (`…&url=` or `{url}`) |
+| `ARIADNE_PROXY_URL` | Generic HTTP(S) or SOCKS5(h) proxy for crawls and live leak-check |
+| `ARIADNE_LEAK_ECHO_URL` | Plain-text IP echo URL for `doctor --leak-check` live probe |
 | `SCRAPY_SETTINGS_MODULE` | Defaults to `ariadne.settings` via CLI |
 | `ARIADNE_USE_XVFB` | Docker entrypoint: `1` (default) enables xvfb-run |
 | `ARIADNE_BROWSER_HEADLESS` | Docker image default `false` |

@@ -31,7 +31,7 @@ Health check:
 
 ```bash
 ariadne doctor
-ariadne doctor --leak-check   # WebRTC disabled in launch args; DNS-via-proxy reminder
+ariadne doctor --leak-check   # WebRTC launch args; optional live probe with proxy + echo URL
 ```
 
 `doctor` must report `TWISTED_REACTOR: …AsyncioSelectorReactor OK`. If not, do not crawl.
@@ -197,7 +197,9 @@ Entrypoint:
 
 ## 11. Recommended engagement sequence
 
-1. `doctor` (+ `--leak-check` if L2).  
+1. `doctor` (+ `--leak-check` if L2). For a **live** leak probe (exit IP + ICE), also set
+   `ARIADNE_PROXY_URL` (or `--proxy`) and a plain-text echo via `ARIADNE_LEAK_ECHO_URL`.
+   Prefer **SOCKS5h** proxies so DNS resolves remotely.  
 2. Narrow `map` on one host with low concurrency.  
 3. Inspect NDJSON + challenge stats; tune proxies / profiles.  
 4. `extract` or `apisnoop` once L1/L2 clearance is stable.  

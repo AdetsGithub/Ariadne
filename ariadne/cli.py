@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,7 +51,18 @@ def init_engagement(
 
 @app.command()
 def doctor(
-    leak_check: bool = typer.Option(False, "--leak-check", help="Verify WebRTC-disabled launch args / DNS guidance"),
+    leak_check: bool = typer.Option(
+        False, "--leak-check", help="Verify WebRTC launch args and optional live proxy leak probe"
+    ),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="Proxy URL for live leak-check (default: ARIADNE_PROXY_URL)"
+    ),
+    leak_echo_url: Optional[str] = typer.Option(
+        None,
+        "--leak-echo-url",
+        envvar="ARIADNE_LEAK_ECHO_URL",
+        help="Plain-text IP echo URL for live leak-check",
+    ),
 ) -> None:
     """Check reactor setting, profile catalog, curl_cffi, and optional Playwright TLS anchor."""
     from ariadne import settings as ariadne_settings
@@ -96,12 +109,36 @@ def doctor(
         from ariadne.browser import BrowserPool
 
         pool = BrowserPool(disable_webrtc=True, proxy_dns=True)
-        args = " ".join(pool._launch_args())
+        launch_args = pool._launch_args()
+        args = " ".join(launch_args)
         if "--disable-webrtc" not in args:
             typer.echo("leak-check FAIL: WebRTC not disabled in launch args", err=True)
             raise typer.Exit(2)
         typer.echo("leak-check: WebRTC disabled in BrowserPool launch args OK")
-        typer.echo("leak-check: use SOCKS5h / provider remote-DNS proxies for DNS-via-proxy")
+
+        proxy_url = proxy or os.environ.get("ARIADNE_PROXY_URL")
+        echo_url = leak_echo_url or os.environ.get("ARIADNE_LEAK_ECHO_URL")
+        if not proxy_url:
+            typer.echo(
+                "leak-check: static OK; set ARIADNE_PROXY_URL (or --proxy) + "
+                "ARIADNE_LEAK_ECHO_URL for live probe"
+            )
+        elif not echo_url:
+            typer.echo(
+                "leak-check: static OK; set ARIADNE_LEAK_ECHO_URL (or --leak-echo-url) "
+                "for live exit-IP / DNS probe",
+                err=True,
+            )
+        else:
+            from ariadne.opsec.leak_check import run_live_leak_check
+
+            typer.echo(f"leak-check: live probe via {proxy_url} → {echo_url}")
+            errors = asyncio.run(run_live_leak_check(proxy_url, echo_url, launch_args))
+            if errors:
+                for err in errors:
+                    typer.echo(f"leak-check FAIL: {err}", err=True)
+                raise typer.Exit(2)
+            typer.echo("leak-check: live proxy / ICE probe OK")
     typer.echo("doctor: OK")
 
 
